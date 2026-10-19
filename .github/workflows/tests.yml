@@ -25,3 +25,31 @@ jobs:
 
       - name: Run CPU tests
         run: pytest -m "not slow and not regression" -v --tb=short
+
+  cpu-tests-min-torch:
+    # Keeps the declared floor honest: pyproject.toml says torch>=2.4, so run the
+    # same suite on exactly that version. Keep this in step with pyproject.toml.
+    name: CPU tests (minimum PyTorch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MIN_TORCH: "2.4.1"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install minimum supported PyTorch (CPU build)
+        run: pip install "torch==${MIN_TORCH}" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: pip install -e ".[test]"
+
+      - name: Confirm the minimum PyTorch was not upgraded
+        run: python -c "import os, torch; v = torch.__version__.split('+')[0]; print('torch', v); assert v == os.environ['MIN_TORCH'], v"
+
+      - name: Run CPU tests
+        run: pytest -m "not slow and not regression" -v --tb=short

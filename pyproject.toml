@@ -39,7 +39,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch>=2.2",
+    # 2.4 is the oldest PyTorch the code supports (torch.amp.autocast_mode.
+    # is_autocast_available); CI tests it in the "CPU tests (minimum PyTorch)" job.
+    "torch>=2.4",
     "numpy>=1.26",
     "hydra-core>=1.3.2",
     "pytorch-lightning>=2.5.0",
