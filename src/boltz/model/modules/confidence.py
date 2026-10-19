@@ -6,8 +6,10 @@ import boltz.model.layers.initialize as init
 from boltz.data import const
 from boltz.model.layers.confidence_utils import (
     compute_aggregated_metric,
+    compute_frame_pred,
     compute_pae_summaries,
     compute_ptms,
+    compute_unweighted_pae_summaries,
 )
 from boltz.model.modules.encoders import RelativePositionEncoder
 from boltz.model.modules.trunk import (
@@ -476,13 +478,25 @@ class ConfidenceHeads(nn.Module):
             ) = compute_pae_summaries(
                 out_dict["pae"], pred_distogram_logits, feats, multiplicity
             )
+            _, frame_mask = compute_frame_pred(
+                x_pred, feats["frames_idx"], feats, multiplicity, inference=True
+            )
             ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm = compute_ptms(
-                pae_logits, x_pred, feats, multiplicity
+                pae_logits, x_pred, feats, multiplicity, frame_mask=frame_mask
             )
             out_dict["ptm"] = ptm
             out_dict["iptm"] = iptm
             out_dict["ligand_iptm"] = ligand_iptm
             out_dict["protein_iptm"] = protein_iptm
             out_dict["pair_chains_iptm"] = pair_chains_iptm
+            # Unweighted PAE summaries, reported alongside the contact-weighted ones.
+            (
+                out_dict["complex_pae_unweighted"],
+                out_dict["complex_ipae_unweighted"],
+                out_dict["chains_pae_unweighted"],
+                out_dict["pair_chains_pae_unweighted"],
+            ) = compute_unweighted_pae_summaries(
+                out_dict["pae"], feats, multiplicity, frame_mask=frame_mask
+            )
 
         return out_dict

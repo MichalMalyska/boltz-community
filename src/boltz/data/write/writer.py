@@ -148,6 +148,10 @@ class BoltzWriter(BasePredictionWriter):
             "complex_ipae",
             "chains_pae",
             "pair_chains_pae",
+            "complex_pae_unweighted",
+            "complex_ipae_unweighted",
+            "chains_pae_unweighted",
+            "pair_chains_pae_unweighted",
             "pair_chains_iptm",
         ):
             if key in prediction:
@@ -320,6 +324,19 @@ class BoltzWriter(BasePredictionWriter):
                         )
                         confidence_summary_dict["pair_chains_pae"] = _select_prediction_value(
                             prediction["pair_chains_pae"], start + model_idx
+                        )
+                    if "complex_pae_unweighted" in prediction:
+                        confidence_summary_dict["complex_pae_unweighted"] = _select_prediction_value(
+                            prediction["complex_pae_unweighted"], start + model_idx
+                        )
+                        confidence_summary_dict["complex_ipae_unweighted"] = _select_prediction_value(
+                            prediction["complex_ipae_unweighted"], start + model_idx
+                        )
+                        confidence_summary_dict["chains_pae_unweighted"] = _select_prediction_value(
+                            prediction["chains_pae_unweighted"], start + model_idx
+                        )
+                        confidence_summary_dict["pair_chains_pae_unweighted"] = _select_prediction_value(
+                            prediction["pair_chains_pae_unweighted"], start + model_idx
                         )
                     path = struct_dir / f"confidence_{rank_suffix}.json"
                     with path.open("w") as f:

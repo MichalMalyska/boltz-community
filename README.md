@@ -70,6 +70,7 @@ Community-maintained fork of [Boltz](https://github.com/jwohlwend/boltz) with bu
 - Added `--skip_bad_inputs` flag: by default `boltz predict` now aborts when any input fails processing; pass `--skip_bad_inputs` to skip bad inputs and continue with the rest
 - Deferred heavy imports (torch, rdkit, pytorch-lightning) so `boltz.main` loads instantly for CLI help and input validation
 - `--devices` now accepts a comma-separated list of specific GPU device IDs in addition to a device count (e.g. `--devices 0,1` targets GPUs 0 and 1; use `CUDA_VISIBLE_DEVICES=1 boltz predict ...` to target a single GPU by index)
+- Added unweighted PAE summaries to `confidence_*.json` alongside the contact-weighted ones: `complex_pae_unweighted`, `complex_ipae_unweighted`, `chains_pae_unweighted`, and `pair_chains_pae_unweighted`. These are plain averages over valid token pairs, the averaging that interface-PAE thresholds from the literature (e.g. `pae_interaction < 10`) were defined on, and match the definition proposed for upstream Boltz in [#707](https://github.com/jwohlwend/boltz/pull/707). The existing contact-weighted fields are unchanged; contact weighting emphasizes pairs in contact, so those values are usually lower and not comparable to such thresholds. See [docs/prediction.md](docs/prediction.md) for when to use each.
 - Added `--batch_size` for Boltz-2 structure inference so multiple inputs can be processed per prediction batch. Current limits: affinity prediction remains single-record (`batch_size=1`), and guided inference (`--use_potentials` / contact guidance) is only supported with `--batch_size 1`
 
 **Performance improvements:**
@@ -82,7 +83,7 @@ Community-maintained fork of [Boltz](https://github.com/jwohlwend/boltz) with bu
 - `process_atom_features` pre-allocates output arrays and fills `atom_to_token` in one slice per token (eliminates per-atom appends)
 
 **Tests & CI:**
-- 294 tests in this fork vs. 5 tests in current upstream `jwohlwend/boltz`: unit tests (CPU), smoke tests (end-to-end inference), regression tests (golden output verification for Boltz-1 and Boltz-2), determinism tests, MSA trim subsequence matching (8 cases), diffusion chunking regression tests, Boltz-2 validation constructor coverage, and featurizer pre-allocation correctness
+- 304 tests in this fork vs. 5 tests in current upstream `jwohlwend/boltz`: unit tests (CPU), smoke tests (end-to-end inference), regression tests (golden output verification for Boltz-1 and Boltz-2), determinism tests, MSA trim subsequence matching (8 cases), diffusion chunking regression tests, Boltz-2 validation constructor coverage, and featurizer pre-allocation correctness
 - GitHub Actions CI with CPU runners (every push/PR) and GPU T4 runners (push to main)
 
 ## Contributing

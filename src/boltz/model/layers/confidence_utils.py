@@ -198,16 +198,95 @@ def compute_pae_summaries(pae, pred_distogram_logits, feats, multiplicity):
     return complex_pae, complex_ipae, chains_pae, pair_chains_pae
 
 
+def compute_unweighted_pae_summaries(pae, feats, multiplicity, frame_mask=None):
+    """Compute unweighted aggregate PAE summaries.
+
+    Plain means over valid token pairs, where ``pae[b, i, j]`` is the expected
+    error of token ``j`` after aligning on the frame of token ``i``. Padding and
+    the diagonal are excluded, and tokens without a valid frame are excluded on
+    the aligned axis, as for pTM / ipTM. This is the averaging used by the
+    interface-PAE filters common in binder design (e.g. ``pae_interaction``),
+    and matches the definition in upstream Boltz PR #707.
+
+    ``compute_pae_summaries`` instead weights each pair by its predicted contact
+    probability, as Boltz does for ``complex_pde`` / ``complex_ipde``.
+
+    Parameters
+    ----------
+    pae : torch.Tensor
+        The aggregated PAE values, shape (B * multiplicity, N, N), in Angstrom.
+    feats : Dict[str, torch.Tensor]
+        The input features.
+    multiplicity : int
+        The batch size of the diffusion roll-out.
+    frame_mask : torch.Tensor, optional
+        Mask of tokens with a valid (non-collinear) frame, shape
+        (B * multiplicity, N). If None, only padding is masked.
+
+    Returns
+    -------
+    Tensor
+        complex_pae: mean PAE over all valid off-diagonal pairs, shape (B,).
+    Tensor
+        complex_ipae: mean PAE over inter-chain pairs, shape (B,); NaN for a
+        single chain.
+    Dict[int, Tensor]
+        chains_pae: mean intra-chain PAE per chain.
+    Dict[int, Dict[int, Tensor]]
+        pair_chains_pae[c1][c2]: mean PAE of chain ``c2`` tokens aligned on the
+        frames of chain ``c1``; NaN when no valid pair exists.
+
+    """
+    token_pad_mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0).float()
+    asym_id = feats["asym_id"].repeat_interleave(multiplicity, 0)
+    if frame_mask is None:
+        frame_mask = token_pad_mask
+    frame_mask = frame_mask.reshape(-1, frame_mask.shape[-1]).float()
+
+    not_diag = 1 - torch.eye(
+        token_pad_mask.shape[1], device=pae.device, dtype=pae.dtype
+    ).unsqueeze(0)
+    pair_mask = (
+        (frame_mask * token_pad_mask).unsqueeze(-1)
+        * token_pad_mask.unsqueeze(-2)
+        * not_diag
+    )
+    interface_pair_mask = pair_mask * (asym_id.unsqueeze(-1) != asym_id.unsqueeze(-2))
+
+    complex_pae = _weighted_mean_or_nan(pae, pair_mask, dims=(1, 2))
+    complex_ipae = _weighted_mean_or_nan(pae, interface_pair_mask, dims=(1, 2))
+
+    valid_asym_id = asym_id[token_pad_mask.bool()]
+    asym_ids_list = torch.unique(valid_asym_id).tolist()
+
+    pair_chains_pae = {}
+    for idx1 in asym_ids_list:
+        idx1_mask = (asym_id.unsqueeze(-1) == idx1).to(pair_mask.dtype)
+        pair_chains_pae[idx1] = {
+            idx2: _weighted_mean_or_nan(
+                pae,
+                pair_mask * idx1_mask * (asym_id.unsqueeze(-2) == idx2).to(pair_mask.dtype),
+                dims=(1, 2),
+            )
+            for idx2 in asym_ids_list
+        }
+
+    chains_pae = {idx: pair_chains_pae[idx][idx] for idx in asym_ids_list}
+    return complex_pae, complex_ipae, chains_pae, pair_chains_pae
+
+
 def tm_function(d, Nres):
     d0 = 1.24 * (torch.clip(Nres, min=19) - 15) ** (1 / 3) - 1.8
     return 1 / (1 + (d / d0) ** 2)
 
 
-def compute_ptms(logits, x_preds, feats, multiplicity):
+def compute_ptms(logits, x_preds, feats, multiplicity, frame_mask=None):
     # It needs to take as input the mask of the frames as they are not used to compute the PTM
-    _, mask_collinear_pred = compute_frame_pred(
-        x_preds, feats["frames_idx"], feats, multiplicity, inference=True
-    )
+    if frame_mask is None:
+        _, frame_mask = compute_frame_pred(
+            x_preds, feats["frames_idx"], feats, multiplicity, inference=True
+        )
+    mask_collinear_pred = frame_mask
     # mask overlapping, collinear tokens and ions (invalid frames)
     mask_pad = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
     maski = mask_collinear_pred.reshape(-1, mask_collinear_pred.shape[-1])

@@ -180,7 +180,7 @@ out_dir/
 ├── predictions/                                               # Contains the model's predictions
     ├── [input_file1]/
         ├── [input_file1]_model_0.cif                          # The predicted structure in CIF format, with the inclusion of per token pLDDT scores
-        ├── confidence_[input_file1]_model_0.json              # The confidence scores (confidence_score, ptm, iptm, ligand_iptm, protein_iptm, complex_plddt, complex_iplddt, complex_pde, complex_ipde, complex_pae, complex_ipae, chains_ptm, pair_chains_iptm, chains_pae, pair_chains_pae)
+        ├── confidence_[input_file1]_model_0.json              # The confidence scores (confidence_score, ptm, iptm, ligand_iptm, protein_iptm, complex_plddt, complex_iplddt, complex_pde, complex_ipde, complex_pae, complex_ipae, chains_ptm, pair_chains_iptm, chains_pae, pair_chains_pae, and the _unweighted variants of the four PAE summaries)
         ├── affinity_[input_file1].json                        # The affinity scores (affinity_pred_value, affinity_probability_binary, affinity_pred_value1, affinity_probability_binary1, affinity_pred_value2, affinity_probability_binary2)
 
         ├── pae_[input_file1]_model_0.npz                      # The predicted PAE score for every pair of tokens
@@ -209,6 +209,8 @@ Each output folder includes a confidence `.json` file with aggregated confidence
     "complex_ipde": 5.1650,           # Contact-weighted average PDE score when aggregating at interfaces
     "complex_pae": 1.2034,            # Contact-weighted average PAE score for the complex
     "complex_ipae": 4.8123,           # Contact-weighted average PAE score when aggregating at interfaces; null when undefined
+    "complex_pae_unweighted": 3.4512, # Unweighted average PAE score for the complex
+    "complex_ipae_unweighted": 6.9310, # Unweighted average PAE score at interfaces (interface PAE, comparable to pae_interaction); null when undefined
     "chains_ptm": {                   # Predicted TM score within each chain
         "0": 0.8533,
         "1": 0.8330
@@ -236,10 +238,28 @@ Each output folder includes a confidence `.json` file with aggregated confidence
             "0": 5.1030,
             "1": null
         }
+    },
+    "chains_pae_unweighted": {        # Unweighted average PAE within each chain; null when undefined
+        "0": 2.1043,
+        "1": null
+    },
+    "pair_chains_pae_unweighted": {   # Unweighted average PAE between each ordered chain pair; null when undefined
+        "0": {
+            "0": 2.1043,
+            "1": 6.2017
+        },
+        "1": {
+            "0": 7.6603,
+            "1": null
+        }
     }
 }
 ```
-`confidence_score`, `ptm` and `plddt` scores (and their interface and individual chain analogues) have a range of [0, 1], where higher values indicate higher confidence. `pde` and `pae` scores have a unit of angstroms, where lower values indicate higher confidence. The aggregated `complex_pde`, `complex_ipde`, `complex_pae`, `complex_ipae`, `chains_pae`, and `pair_chains_pae` values are contact-weighted. Fields with no valid contact-weighted token pairs are written as `null`.
+`confidence_score`, `ptm` and `plddt` scores (and their interface and individual chain analogues) have a range of [0, 1], where higher values indicate higher confidence. `pde` and `pae` scores have a unit of angstroms, where lower values indicate higher confidence. The aggregated `complex_pde`, `complex_ipde`, `complex_pae`, `complex_ipae`, `chains_pae`, and `pair_chains_pae` values are contact-weighted: each token pair counts in proportion to its predicted probability of being in contact, taken from the distogram. This is how Boltz aggregates PDE.
+
+Each PAE summary also has an `_unweighted` counterpart (`complex_pae_unweighted`, `complex_ipae_unweighted`, `chains_pae_unweighted`, `pair_chains_pae_unweighted`): a plain average over all valid token pairs. **Use the unweighted values when comparing against thresholds from the literature**, such as the interface PAE filter `pae_interaction < 10` used in binder design (Bennett et al., 2023), since those thresholds were defined on plain averages. Contact weighting emphasizes pairs in contact, which tend to have low error, so the contact-weighted values are usually lower than their unweighted counterparts, often by a large margin, and are not comparable to such thresholds. Use the contact-weighted values to judge the parts of the structure that are actually in contact.
+
+Both sets exclude padding and the diagonal. The unweighted values also exclude tokens without a valid frame on the aligned axis, as pTM and ipTM do, and match the definition proposed for upstream Boltz in [jwohlwend/boltz#707](https://github.com/jwohlwend/boltz/pull/707). `pair_chains_pae[i][j]` is the error of chain `j` when the structure is aligned on chain `i`, so it is not symmetric. Fields with no valid token pairs are written as `null`.
 
 The output affinity `.json` file is organized as follows:
 ```yaml

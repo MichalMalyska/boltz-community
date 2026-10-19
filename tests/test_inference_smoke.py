@@ -179,6 +179,30 @@ properties:
             f"affinity_pred_value outside plausible range [-10, 10]: {pred_val}"
         )
 
+        # --- PAE summaries in the confidence JSON: both families present ---
+        # Joins the confidence module to the writer. Protein + ligand is two
+        # chains, so the interface values must be defined (not null).
+        confidence_file = next(
+            (f for f in affinity_files if os.path.basename(f).startswith("confidence_")),
+            None,
+        )
+        assert confidence_file is not None, "No confidence_*.json file found"
+        with open(confidence_file) as f:
+            confidence_data = json.load(f)
+        for base in ("complex_pae", "complex_ipae", "chains_pae", "pair_chains_pae"):
+            for key in (base, f"{base}_unweighted"):
+                assert key in confidence_data, (
+                    f"{key} missing from {confidence_file}. "
+                    f"Keys present: {sorted(confidence_data)}"
+                )
+        for key in ("complex_ipae", "complex_ipae_unweighted"):
+            assert isinstance(confidence_data[key], float), (
+                f"{key} should be a number for a two-chain input: {confidence_data[key]!r}"
+            )
+        assert set(confidence_data["chains_pae_unweighted"]) == set(
+            confidence_data["chains_pae"]
+        )
+
         # --- Structure CIF with ligand ---
         cif_files = _find_files(pred_dir, ".cif")
         assert len(cif_files) > 0, "No .cif output files found"

@@ -6,8 +6,10 @@ import boltz.model.layers.initialize as init
 from boltz.data import const
 from boltz.model.layers.confidence_utils import (
     compute_aggregated_metric,
+    compute_frame_pred,
     compute_pae_summaries,
     compute_ptms,
+    compute_unweighted_pae_summaries,
 )
 from boltz.model.layers.pairformer import PairformerModule
 from boltz.model.modules.encodersv2 import RelativePositionEncoder
@@ -481,9 +483,13 @@ class ConfidenceHeads(nn.Module):
             out_dict["pae"], pred_distogram_logits, feats, multiplicity
         )
 
+        frame_mask = None
         try:
+            _, frame_mask = compute_frame_pred(
+                x_pred, feats["frames_idx"], feats, multiplicity, inference=True
+            )
             ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm = compute_ptms(
-                pae_logits, x_pred, feats, multiplicity
+                pae_logits, x_pred, feats, multiplicity, frame_mask=frame_mask
             )
             out_dict["ptm"] = ptm
             out_dict["iptm"] = iptm
@@ -497,5 +503,17 @@ class ConfidenceHeads(nn.Module):
             out_dict["ligand_iptm"] = torch.zeros_like(complex_plddt)
             out_dict["protein_iptm"] = torch.zeros_like(complex_plddt)
             out_dict["pair_chains_iptm"] = torch.zeros_like(complex_plddt)
+
+        # Unweighted PAE summaries, reported alongside the contact-weighted ones.
+        # If frame construction failed above, frame_mask is None and only
+        # padding is masked.
+        (
+            out_dict["complex_pae_unweighted"],
+            out_dict["complex_ipae_unweighted"],
+            out_dict["chains_pae_unweighted"],
+            out_dict["pair_chains_pae_unweighted"],
+        ) = compute_unweighted_pae_summaries(
+            out_dict["pae"], feats, multiplicity, frame_mask=frame_mask
+        )
 
         return out_dict
