@@ -210,7 +210,7 @@ Each output folder includes a confidence `.json` file with aggregated confidence
     "complex_pae": 1.2034,            # Contact-weighted average PAE score for the complex
     "complex_ipae": 4.8123,           # Contact-weighted average PAE score when aggregating at interfaces; null when undefined
     "complex_pae_unweighted": 3.4512, # Unweighted average PAE score for the complex
-    "complex_ipae_unweighted": 6.9310, # Unweighted average PAE score at interfaces (interface PAE, comparable to pae_interaction); null when undefined
+    "complex_ipae_unweighted": 6.9310, # Unweighted average PAE score over all inter-chain pairs; binder-target PAE only for two chains (see below); null when undefined
     "chains_ptm": {                   # Predicted TM score within each chain
         "0": 0.8533,
         "1": 0.8330
@@ -257,7 +257,20 @@ Each output folder includes a confidence `.json` file with aggregated confidence
 ```
 `confidence_score`, `ptm` and `plddt` scores (and their interface and individual chain analogues) have a range of [0, 1], where higher values indicate higher confidence. `pde` and `pae` scores have a unit of angstroms, where lower values indicate higher confidence. The aggregated `complex_pde`, `complex_ipde`, `complex_pae`, `complex_ipae`, `chains_pae`, and `pair_chains_pae` values are contact-weighted: each token pair counts in proportion to its predicted probability of being in contact, taken from the distogram. This is how Boltz aggregates PDE.
 
-Each PAE summary also has an `_unweighted` counterpart (`complex_pae_unweighted`, `complex_ipae_unweighted`, `chains_pae_unweighted`, `pair_chains_pae_unweighted`): a plain average over all valid token pairs. **Use the unweighted values when comparing against thresholds from the literature**, such as the interface PAE filter `pae_interaction < 10` used in binder design (Bennett et al., 2023), since those thresholds were defined on plain averages. Contact weighting emphasizes pairs in contact, which tend to have low error, so the contact-weighted values are usually lower than their unweighted counterparts, often by a large margin, and are not comparable to such thresholds. Use the contact-weighted values to judge the parts of the structure that are actually in contact.
+Each PAE summary also has an `_unweighted` counterpart (`complex_pae_unweighted`, `complex_ipae_unweighted`, `chains_pae_unweighted`, `pair_chains_pae_unweighted`): a plain average over all valid token pairs. This is the averaging used by the PAE metrics common in binder design, such as `pae_interaction` (Bennett et al., 2023). Contact weighting emphasizes pairs in contact, which tend to have low error, so the contact-weighted values are usually lower than their unweighted counterparts, often by a large margin, and should not be compared with such metrics. Use the contact-weighted values to judge the parts of the structure that are actually in contact.
+
+Two caveats when using the unweighted values for binder screening:
+
+- **`complex_ipae_unweighted` is binder–target PAE only for two chains.** It averages every pair of tokens on different chains. `pae_interaction` averages only binder–target pairs: the mean of the binder-to-target and target-to-binder blocks, with all non-binder chains treated as the target. With one binder chain and one target chain the two are the same. With a multi-chain target, `complex_ipae_unweighted` also includes the pairs *between target chains*, which are often confident and can make a poorly placed binder look good. Compute binder–target PAE from `pair_chains_pae_unweighted` instead. For binder chain `b` and target chains `t` with `n_t` tokens each:
+
+  ```
+  binder_to_target = sum_t( n_t * pair_chains_pae_unweighted[b][t] ) / sum_t( n_t )
+  target_to_binder = sum_t( n_t * pair_chains_pae_unweighted[t][b] ) / sum_t( n_t )
+  pae_interaction  = ( binder_to_target + target_to_binder ) / 2
+  ```
+
+  With a single target chain this is `(pair_chains_pae_unweighted[b][t] + pair_chains_pae_unweighted[t][b]) / 2`. A protein chain has one token per residue; a ligand has one token per atom. The weighting by `n_t` is exact when no tokens are excluded for lacking a valid frame, which is the normal case for proteins; otherwise compute the blocks directly from the full matrix in `pae_*.npz`. Chain indices are the order of chains in the predicted structure file. They are not always the input order, because chains with identical sequences are grouped together.
+- **The same averaging does not make a published threshold valid for Boltz.** Cutoffs such as `pae_interaction < 10` were calibrated on AlphaFold2's PAE. Boltz predicts its own PAE, and those cutoffs have not been validated on it. Treat them as a starting point and calibrate on your own data.
 
 Both sets exclude padding and the diagonal. The unweighted values also exclude tokens without a valid frame on the aligned axis, as pTM and ipTM do, and match the definition proposed for upstream Boltz in [jwohlwend/boltz#707](https://github.com/jwohlwend/boltz/pull/707). `pair_chains_pae[i][j]` is the error of chain `j` when the structure is aligned on chain `i`, so it is not symmetric. Fields with no valid token pairs are written as `null`.
 
