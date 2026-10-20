@@ -12,7 +12,7 @@ Community-maintained fork of [Boltz](https://github.com/jwohlwend/boltz) with bu
 - `fairscale` dependency removed — replaced with PyTorch built-in `torch.utils.checkpoint`
 - `numpy<2.0` cap removed
 - `requires-python` widened to `>=3.10` (removed `<3.13` cap)
-- Compatible with PyTorch 2.6+ and Lightning 2.6+
+- Requires PyTorch 2.4 or newer (`torch>=2.4`); CI tests the 2.4 minimum alongside the latest release. Compatible with Lightning 2.6+
 
 **Bug fixes:**
 - Fixed ROCm DDP crashes by allocating tensors directly on the target device instead of CPU-then-move ([#654](https://github.com/jwohlwend/boltz/pull/654))
@@ -92,7 +92,7 @@ Community-maintained fork of [Boltz](https://github.com/jwohlwend/boltz) with bu
 - `process_atom_features` pre-allocates output arrays and fills `atom_to_token` in one slice per token (eliminates per-atom appends)
 
 **Tests & CI:**
-- 304 tests in this fork vs. 5 tests in current upstream `jwohlwend/boltz`: unit tests (CPU), smoke tests (end-to-end inference), regression tests (golden output verification for Boltz-1 and Boltz-2), determinism tests, MSA trim subsequence matching (8 cases), diffusion chunking regression tests, Boltz-2 validation constructor coverage, and featurizer pre-allocation correctness
+- 351 tests in this fork vs. 5 tests in current upstream `jwohlwend/boltz`: unit tests (CPU), smoke tests (end-to-end inference), regression tests (golden output verification for Boltz-1 and Boltz-2), determinism tests, MSA trim subsequence matching (8 cases), diffusion chunking regression tests, Boltz-2 validation constructor coverage, and featurizer pre-allocation correctness
 - GitHub Actions CI with CPU runners (every push/PR) and GPU T4 runners (push to main)
 
 ## Contributing
