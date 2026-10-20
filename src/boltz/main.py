@@ -1108,6 +1108,27 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
     return int(value)
 
 
+def _records_with_stereocenters(processed: "BoltzProcessedInput") -> list[str]:
+    """Return ids of records with stereocentres, in ligands or modified residues.
+
+    Those stereocentres get chiral atom constraints, but the constraints are only
+    applied during sampling when --use_potentials is set. Without it,
+    stereochemistry comes from the model alone, which often inverts or flattens
+    stereocentres; confidence scores do not reveal it.
+    """
+    from boltz.data.types import ResidueConstraints
+
+    if processed.constraints_dir is None:
+        return []
+
+    flagged = []
+    for record in processed.manifest.records:
+        path = processed.constraints_dir / f"{record.id}.npz"
+        if path.exists() and len(ResidueConstraints.load(path).chiral_atom_constraints):
+            flagged.append(record.id)
+    return flagged
+
+
 @cli.command(context_settings={"show_default": True})
 @click.argument("data", type=click.Path(exists=True))
 @click.option(
@@ -1624,6 +1645,18 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             (processed_dir / "mols") if (processed_dir / "mols").exists() else None
         ),
     )
+
+    if not use_potentials:
+        flagged = _records_with_stereocenters(processed)
+        if flagged:
+            shown = ", ".join(flagged[:5]) + (" ..." if len(flagged) > 5 else "")
+            click.echo(
+                f"Warning: {len(flagged)} input(s) have stereocentres, in ligands or "
+                f"modified residues: {shown}. Stereochemistry is only enforced with "
+                "--use_potentials. Without it, predictions often have inverted or "
+                "flattened stereocentres, and the confidence scores do not reveal "
+                "this. Consider re-running with --use_potentials."
+            )
 
     # Set up trainer
     strategy = "auto"
