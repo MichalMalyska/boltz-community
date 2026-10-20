@@ -95,6 +95,23 @@ Community-maintained fork of [Boltz](https://github.com/jwohlwend/boltz) with bu
 - 362 tests vs. 5 in upstream `jwohlwend/boltz`: unit, end-to-end smoke, golden-output regression (Boltz-1 and Boltz-2) and determinism tests
 - GitHub Actions CI with CPU runners (every push/PR) and GPU T4 runners (push to main)
 
+## Contributors
+
+boltz-community builds on [Boltz](https://github.com/jwohlwend/boltz) by Jeremy Wohlwend, Gabriele Corso, Saro Passaro and the upstream contributors. GitHub doesn't list contributors on forks, so see the [contributors page](https://github.com/Novel-Therapeutics/boltz-community/graphs/contributors) for everyone with commits here.
+
+Thanks to everyone whose code, upstream PRs or reports are in this fork:
+
+- [@UniversalBasicInc](https://github.com/UniversalBasicInc): Intel GPU support
+- [@corinwagen](https://github.com/corinwagen): CPU checkpoint staging
+- [@fnachon](https://github.com/fnachon): macOS libomp fix
+- [@AtharvaTilewale](https://github.com/AtharvaTilewale): unweighted PAE summaries
+- [@edusbarbosa](https://github.com/edusbarbosa): scheduler fix with warmup disabled
+- [@chr-szogun](https://github.com/chr-szogun): ligand bond orders in PDB output
+- [@ameya98](https://github.com/ameya98): PDB chain IDs
+- [@alexcritschristoph](https://github.com/alexcritschristoph) and [@jsilter](https://github.com/jsilter): chain id length
+- [@Michaelihc](https://github.com/Michaelihc): affinity-to-ΔG documentation
+- [@TSC2412](https://github.com/TSC2412): cyclic D-peptide stereochemistry report
+
 ## Contributing
 
 Pull requests are welcome! If you have a bug fix, test improvement, or compatibility enhancement, please open a PR.
