@@ -146,8 +146,11 @@ Anthropic's [uplifting-biomolecular-modeling](https://github.com/anthropics/upli
 ```
 pip install "boltz-community[cuda]"
 git clone https://github.com/anthropics/uplifting-biomolecular-modeling.git
+git -C uplifting-biomolecular-modeling checkout f4f62fa6592ae4938d49b1757bea0cfeff9f468e
 pip install -e uplifting-biomolecular-modeling/common/opt_core
 ```
+
+The adapter's API checks and A10G validation used `opt_core` 0.5.228.0 at commit [`f4f62fa6592ae4938d49b1757bea0cfeff9f468e`](https://github.com/anthropics/uplifting-biomolecular-modeling/commit/f4f62fa6592ae4938d49b1757bea0cfeff9f468e), pinned above. Native shared-cache invalidation still requires GPU validation on compute capability 9.0 (H100, H200 or GH200); the A10G results do not cover it. If installing another revision, run `TestOptCoreInterface` in `tests/model/layers/test_flashpairformer.py` to check the required APIs, including `trimul.native.shared_geometries()` and `payload_cache()`.
 
 When `opt_core` is importable, `boltz predict` uses it by default on NVIDIA GPUs with compute capability 8.0 or newer (A100, H100, and later). For each call, `opt_core` picks the kernel it measured fastest for the GPU and input size. Any call it cannot serve (an unsupported GPU or shape, a missing prebuilt binary, a kernel error) runs on cuEquivariance, and without cuEquivariance on PyTorch, as before. A kernel error disables FlashPairformer for the rest of the process with a warning.
 

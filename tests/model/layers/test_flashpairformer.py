@@ -543,6 +543,7 @@ class TestOptCoreInterface:
                     "triangle_multiplication",
                 ],
             ),
+            ("trimul.native", ["shared_geometries", "payload_cache"]),
         ],
     )
     def test_kernel_modules(self, module: str, names: list[str]) -> None:

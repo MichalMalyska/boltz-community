@@ -8,6 +8,8 @@ installed, and are excluded from CI; run them manually:
 - ``exact`` must be bit-identical to the cuequivariance op.
 - ``fast`` must be about as close to an fp32 PyTorch reference as the
   cuequivariance op is.
+- Native weight invalidation additionally needs compute capability 9.0
+  (H100, H200 or GH200); the test asserts native actually served the call.
 """
 
 import importlib.util
@@ -168,7 +170,7 @@ def test_fp32_uses_existing_kernels(
     [
         (TriangleMultiplicationOutgoing, 256, False),
         (TriangleMultiplicationIncoming, 256, False),
-        pytest.param(TriangleMultiplicationOutgoing, 384, True, id="h100-native"),
+        pytest.param(TriangleMultiplicationOutgoing, 384, True, id="sm90-native"),
     ],
 )
 def test_weight_update_matches_fresh_pack(
@@ -178,8 +180,8 @@ def test_weight_update_matches_fresh_pack(
     require_native: bool,
 ) -> None:
     """Changing a non-owner parameter must invalidate a real backend's pack."""
-    if require_native and "H100" not in torch.cuda.get_device_name():
-        pytest.skip("native-range regression requires an H100")
+    if require_native and torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("native-range regression requires compute capability 9.0")
     layer = build(layer_cls, dim=128)
     x, mask = inputs(num_tokens, dim=128)
 
