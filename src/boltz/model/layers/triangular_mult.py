@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 
+from boltz.model.layers import flashpairformer
 from boltz.model.layers import initialize as init
 
 
@@ -59,6 +60,9 @@ def _is_recoverable_kernel_error(error: Exception) -> bool:
 
 
 def _kernel_or_none(**kwargs: object) -> Optional[Tensor]:
+    out = flashpairformer.triangle_multiplication(**kwargs)
+    if out is not None:
+        return out
     if _kernel_failure["reason"] is not None:
         return None
     try:
