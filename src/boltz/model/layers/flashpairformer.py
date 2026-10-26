@@ -80,9 +80,8 @@ def boltz2_inference(function: Callable) -> Callable:
     return scoped_forward
 
 
-@functools.cache
 def tier() -> str:
-    """Return the configured tier (``fast``, ``exact`` or ``off``)."""
+    """Read the current tier, including environment changes between calls."""
     value = os.environ.get(ENV_VAR, "fast").strip().lower() or "fast"
     if value in ("0", "false", "no", "none"):
         return "off"
@@ -96,6 +95,12 @@ def tier() -> str:
     return value
 
 
+@functools.cache
+def _prepare_kernel_environment() -> None:
+    """Quiet opt_core's census once, only when the optional route is admitted."""
+    os.environ.setdefault("OPT_CORE_CELL_CENSUS_PRINT", "0")
+
+
 def _kernels(x: Tensor, name: str) -> Optional[ModuleType]:
     """Return the ``opt_core.kernels`` module to try for a call on ``x``, if any."""
     if _kernel_failure["reason"] is not None or tier() == "off":
@@ -104,14 +109,13 @@ def _kernels(x: Tensor, name: str) -> Optional[ModuleType]:
         return None
     # The measured route is CUDA bf16 autocast only. In particular, affinity's
     # explicitly disabled autocast must keep the existing fp32 implementation.
-    if not x.is_cuda or not torch.is_autocast_enabled():
+    if not x.is_cuda or not torch.is_autocast_enabled("cuda"):
         return None
     if torch.get_autocast_dtype("cuda") != torch.bfloat16:
         return None
     if torch.cuda.get_device_capability(x.device) < (8, 0):
         return None
-    # opt_core prints a per-process kernel census at exit unless asked not to.
-    os.environ.setdefault("OPT_CORE_CELL_CENSUS_PRINT", "0")
+    _prepare_kernel_environment()
     try:
         return importlib.import_module(f"opt_core.kernels.{name}")
     except ImportError:
@@ -120,7 +124,10 @@ def _kernels(x: Tensor, name: str) -> Optional[ModuleType]:
 
 def _on_kernel_error(error: Exception) -> None:
     """Disable opt_core after a kernel error; out-of-memory errors propagate."""
-    if isinstance(error, torch.cuda.OutOfMemoryError) or "out of memory" in str(error):
+    if (
+        isinstance(error, torch.cuda.OutOfMemoryError)
+        or "out of memory" in str(error).casefold()
+    ):
         raise error
     _kernel_failure["reason"] = f"{type(error).__name__}: {error}"
     warnings.warn(
@@ -162,13 +169,46 @@ def triangle_attention(
         return None
 
 
-def _trimul_cache(weight: Tensor) -> dict:
-    """Return opt_core's packed-weight cache for the layer that owns ``weight``."""
+def clear_weight_caches() -> None:
+    """Drop packed weights after writes that bypass PyTorch version tracking."""
+    # Keep each live owner's empty slot and its existing finalizer.
+    for cache in tuple(_trimul_caches.values()):
+        cache.clear()
+
+
+def _trimul_cache(weight: Tensor, *other_weights: Tensor, eps: float = 1e-5) -> dict:
+    """Reuse packs only while all source parameters and normalization agree."""
     key = id(weight)
+    try:
+        signature = (
+            eps,
+            tuple(
+                (
+                    id(tensor),
+                    tensor._version,  # noqa: SLF001
+                    tensor.data_ptr(),
+                    tuple(tensor.shape),
+                    tensor.stride(),
+                    tensor.dtype,
+                    tensor.device,
+                )
+                for tensor in (weight, *other_weights)
+            ),
+        )
+    except RuntimeError:
+        # Parameters created in inference_mode have no version counter. Their
+        # writes cannot be detected, so never reuse packed weights for them.
+        cache = _trimul_caches.get(key)
+        if cache is not None:
+            cache.clear()
+        return {}
     cache = _trimul_caches.get(key)
     if cache is None:
         cache = _trimul_caches[key] = {}
         weakref.finalize(weight, _trimul_caches.pop, key, None)
+    if cache.get("_boltz_weight_signature") != signature:
+        cache.clear()
+        cache["_boltz_weight_signature"] = signature
     return cache
 
 
@@ -235,23 +275,24 @@ def triangle_multiplication(
         return None
     # Boltz packs the a and b projections as the two halves of p_in / g_in.
     d = p_in_weight.shape[0] // 2
+    # opt_core retains source tensors in its packs. Detach before slicing so
+    # retained views cannot keep the owning Parameter alive and defeat cleanup.
+    p_in = p_in_weight.detach()
+    g_in = g_in_weight.detach()
     weights = {
-        "ln_in_w": norm_in_weight,
-        "ln_in_b": norm_in_bias,
-        "w_ap": p_in_weight[:d],
-        "w_ag": g_in_weight[:d],
-        "w_bp": p_in_weight[d:],
-        "w_bg": g_in_weight[d:],
-        "ln_out_w": norm_out_weight,
-        "ln_out_b": norm_out_bias,
-        "w_o": p_out_weight,
-        "w_og": g_out_weight,
+        "ln_in_w": norm_in_weight.detach(),
+        "ln_in_b": norm_in_bias.detach(),
+        "w_ap": p_in[:d],
+        "w_ag": g_in[:d],
+        "w_bp": p_in[d:],
+        "w_bg": g_in[d:],
+        "ln_out_w": norm_out_weight.detach(),
+        "ln_out_b": norm_out_bias.detach(),
+        "w_o": p_out_weight.detach(),
+        "w_og": g_out_weight.detach(),
     }
     try:
         z = x if x.dim() == 4 else x[None]
-        backward = torch.is_grad_enabled() and (
-            x.requires_grad or any(w.requires_grad for w in weights.values())
-        )
         selection = _trimul_selection(
             torch.cuda.get_device_capability(z.device),
             trimul.call_precision(z)[0],
@@ -259,8 +300,8 @@ def triangle_multiplication(
             tuple(z.shape),
             d,
             direction,
-            backward,
-            tier(),
+            backward=False,  # _kernels admits only gradient-disabled inference.
+            word=tier(),
         )
         if selection.row in trimul.STOCK_ROWS:
             return None
@@ -270,7 +311,17 @@ def triangle_multiplication(
             direction=direction,
             weights=weights,
             selection=selection,
-            cache=_trimul_cache(p_in_weight),
+            cache=_trimul_cache(
+                p_in_weight,
+                norm_in_weight,
+                norm_in_bias,
+                g_in_weight,
+                norm_out_weight,
+                norm_out_bias,
+                p_out_weight,
+                g_out_weight,
+                eps=eps,
+            ),
             eps=eps,
         )
     except trimul.Refusal:

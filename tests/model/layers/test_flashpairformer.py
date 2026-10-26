@@ -6,7 +6,9 @@ The kernels themselves are checked against cuequivariance on a GPU in
 test_flashpairformer_cuda.py.
 """
 
+import gc
 import importlib
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -25,9 +27,11 @@ from boltz.model.layers.triangular_mult import (
 def fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset the route's per-process state around each test."""
     monkeypatch.setitem(flashpairformer._kernel_failure, "reason", None)  # noqa: SLF001
-    flashpairformer.tier.cache_clear()
+    flashpairformer._prepare_kernel_environment.cache_clear()  # noqa: SLF001
+    flashpairformer.clear_weight_caches()
     yield
-    flashpairformer.tier.cache_clear()
+    flashpairformer._prepare_kernel_environment.cache_clear()  # noqa: SLF001
+    flashpairformer.clear_weight_caches()
 
 
 @pytest.fixture
@@ -58,6 +62,11 @@ class TestTier:
         monkeypatch.setenv(flashpairformer.ENV_VAR, "turbo")
         with pytest.warns(RuntimeWarning, match="turbo"):
             assert flashpairformer.tier() == "fast"
+
+    def test_environment_changes_apply_without_reset(self, monkeypatch) -> None:
+        for value in ("fast", "off", "exact", "fast"):
+            monkeypatch.setenv(flashpairformer.ENV_VAR, value)
+            assert flashpairformer.tier() == value
 
 
 class TestRoute:
@@ -102,12 +111,19 @@ class TestRoute:
             flashpairformer._on_kernel_error(RuntimeError("triton compile failed"))  # noqa: SLF001
         assert "triton compile failed" in flashpairformer._kernel_failure["reason"]  # noqa: SLF001
 
-    def test_out_of_memory_propagates(self) -> None:
+    @pytest.mark.parametrize(
+        "error",
+        [
+            torch.cuda.OutOfMemoryError("CUDA out of memory"),
+            RuntimeError("CUDA OUT OF MEMORY"),
+            RuntimeError("Out Of Memory in kernel"),
+        ],
+    )
+    def test_out_of_memory_propagates(self, error: Exception) -> None:
         """Out-of-memory errors are raised, not turned into a fallback."""
-        with pytest.raises(torch.cuda.OutOfMemoryError):
-            flashpairformer._on_kernel_error(  # noqa: SLF001
-                torch.cuda.OutOfMemoryError("CUDA out of memory")
-            )
+        with pytest.raises(type(error)) as caught:
+            flashpairformer._on_kernel_error(error)  # noqa: SLF001
+        assert caught.value is error
         assert flashpairformer._kernel_failure["reason"] is None  # noqa: SLF001
 
 
@@ -120,7 +136,7 @@ def cuda_dispatch(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         flashpairformer, "importlib", SimpleNamespace(import_module=importer)
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
-    monkeypatch.setattr(torch, "is_autocast_enabled", lambda: True)
+    monkeypatch.setattr(torch, "is_autocast_enabled", lambda device: device == "cuda")
     monkeypatch.setattr(torch, "get_autocast_dtype", lambda device: torch.bfloat16)
     return SimpleNamespace(
         tensor=SimpleNamespace(
@@ -161,7 +177,11 @@ class TestInferenceAdmission:
         capability: tuple[int, int],
         accepted: bool,
     ) -> None:
-        monkeypatch.setattr(torch, "is_autocast_enabled", lambda: autocast)
+        monkeypatch.setattr(
+            torch,
+            "is_autocast_enabled",
+            lambda device: autocast if device == "cuda" else False,
+        )
         monkeypatch.setattr(torch, "get_autocast_dtype", lambda device: dtype)
         monkeypatch.setattr(
             torch.cuda, "get_device_capability", lambda device: capability
@@ -217,6 +237,106 @@ class TestInferenceAdmission:
             assert flashpairformer._kernels(cuda_dispatch.tensor, "triattn") is None
         cuda_dispatch.importer.assert_not_called()
 
+    def test_tier_changes_control_dispatch_without_reset(
+        self, monkeypatch, cuda_dispatch
+    ):
+        with torch.no_grad(), flashpairformer.inference_scope():
+            monkeypatch.setenv(flashpairformer.ENV_VAR, "off")
+            assert flashpairformer._kernels(cuda_dispatch.tensor, "trimul") is None
+            monkeypatch.setenv(flashpairformer.ENV_VAR, "fast")
+            assert (
+                flashpairformer._kernels(cuda_dispatch.tensor, "trimul")
+                is cuda_dispatch.backend
+            )
+            monkeypatch.setenv(flashpairformer.ENV_VAR, "off")
+            assert flashpairformer._kernels(cuda_dispatch.tensor, "trimul") is None
+        cuda_dispatch.importer.assert_called_once()
+
+    def test_census_setup_is_lazy_and_runs_once(self, monkeypatch, cuda_dispatch):
+        monkeypatch.delenv("OPT_CORE_CELL_CENSUS_PRINT", raising=False)
+        setter = Mock(wraps=flashpairformer.os.environ.setdefault)
+        monkeypatch.setattr(flashpairformer.os.environ, "setdefault", setter)
+        with torch.no_grad():
+            assert flashpairformer._kernels(cuda_dispatch.tensor, "triattn") is None
+            setter.assert_not_called()
+            with flashpairformer.inference_scope():
+                flashpairformer._kernels(cuda_dispatch.tensor, "triattn")
+                flashpairformer._kernels(cuda_dispatch.tensor, "trimul")
+        setter.assert_called_once_with("OPT_CORE_CELL_CENSUS_PRINT", "0")
+
+    def test_failure_stays_latched_across_tier_changes(
+        self, monkeypatch, cuda_dispatch
+    ):
+        with pytest.warns(RuntimeWarning):
+            flashpairformer._on_kernel_error(RuntimeError("kernel failed"))
+        with torch.no_grad(), flashpairformer.inference_scope():
+            for value in ("off", "fast", "exact"):
+                monkeypatch.setenv(flashpairformer.ENV_VAR, value)
+                assert flashpairformer._kernels(cuda_dispatch.tensor, "triattn") is None
+        cuda_dispatch.importer.assert_not_called()
+
+    def test_cpu_autocast_does_not_admit_cuda(self, monkeypatch):
+        importer = Mock()
+        monkeypatch.setattr(
+            flashpairformer, "importlib", SimpleNamespace(import_module=importer)
+        )
+        tensor = SimpleNamespace(is_cuda=True, device=torch.device("cuda"))
+        with (
+            torch.no_grad(),
+            flashpairformer.inference_scope(),
+            torch.autocast("cpu", dtype=torch.bfloat16),
+        ):
+            assert torch.is_autocast_enabled("cpu")
+            assert flashpairformer._kernels(tensor, "trimul") is None
+        importer.assert_not_called()
+
+
+@pytest.fixture
+def packed_trimul(monkeypatch):
+    """A backend that retains detached sources and packs them only on cache miss."""
+
+    def kernel(x, mask, *, weights, cache, eps, **kwargs):
+        if "test_pack" not in cache:
+            cache["test_pack"] = {key: value.clone() for key, value in weights.items()}
+            cache["test_sources"] = weights
+        return x.new_tensor(
+            sum(value.sum().item() for value in cache["test_pack"].values())
+        )
+
+    backend = SimpleNamespace(
+        STOCK_ROWS=(),
+        Refusal=RuntimeError,
+        triangle_multiplication=kernel,
+        call_precision=lambda x: ("bf16", None),
+    )
+    monkeypatch.setattr(flashpairformer, "_kernels", lambda *args: backend)
+    monkeypatch.setattr(flashpairformer, "_trimul_stack", lambda device: "test")
+    monkeypatch.setattr(
+        flashpairformer,
+        "_trimul_selection",
+        lambda *args, **kwargs: SimpleNamespace(row="test"),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+
+    def run(layer):
+        with torch.no_grad():
+            return flashpairformer.triangle_multiplication(
+                x=torch.ones(1, 4, 4, 16),
+                mask=torch.ones(1, 4, 4),
+                direction="outgoing",
+                norm_in_weight=layer.norm_in.weight,
+                norm_in_bias=layer.norm_in.bias,
+                p_in_weight=layer.p_in.weight,
+                g_in_weight=layer.g_in.weight,
+                norm_out_weight=layer.norm_out.weight,
+                norm_out_bias=layer.norm_out.bias,
+                p_out_weight=layer.p_out.weight,
+                g_out_weight=layer.g_out.weight,
+                eps=1e-5,
+            )
+
+    return run
+
 
 class TestTriangleMultiplicationCache:
     """Tests for the per-layer cache handed to opt_core."""
@@ -235,6 +355,69 @@ class TestTriangleMultiplicationCache:
         flashpairformer._trimul_cache(weight)  # noqa: SLF001
         del weight
         assert key not in flashpairformer._trimul_caches  # noqa: SLF001
+
+    @pytest.mark.parametrize(
+        "parameter",
+        [
+            "norm_in.weight",
+            "norm_in.bias",
+            "p_in.weight",
+            "g_in.weight",
+            "norm_out.weight",
+            "norm_out.bias",
+            "p_out.weight",
+            "g_out.weight",
+        ],
+    )
+    def test_tracked_update_matches_fresh_pack(self, packed_trimul, parameter):
+        layer = TriangleMultiplicationOutgoing(dim=16)
+        before = packed_trimul(layer)
+        with torch.no_grad():
+            dict(layer.named_parameters())[parameter].add_(1)
+        updated = packed_trimul(layer)
+        flashpairformer.clear_weight_caches()
+        assert torch.equal(updated, packed_trimul(layer))
+        assert not torch.equal(before, updated)
+
+    def test_inference_created_weights_are_not_reused(self, packed_trimul):
+        with torch.inference_mode():
+            layer = TriangleMultiplicationOutgoing(dim=16)
+        before = packed_trimul(layer)
+        with torch.inference_mode():
+            layer.norm_out.bias.add_(1)
+        assert not torch.equal(before, packed_trimul(layer))
+        assert id(layer.p_in.weight) not in flashpairformer._trimul_caches
+
+    def test_storage_replacement_invalidates_pack(self, packed_trimul):
+        layer = TriangleMultiplicationOutgoing(dim=16)
+        before = packed_trimul(layer)
+        # Replacing .data does not advance the parameter's version counter.
+        layer.g_in.weight.data = layer.g_in.weight.detach().clone() + 1
+        assert not torch.equal(before, packed_trimul(layer))
+
+    def test_untracked_write_can_clear_packs(self, packed_trimul):
+        layer = TriangleMultiplicationOutgoing(dim=16)
+        before = packed_trimul(layer)
+        layer.p_in.weight.data.add_(1)
+        flashpairformer.clear_weight_caches()
+        assert not torch.equal(before, packed_trimul(layer))
+
+    def test_normalization_change_invalidates_pack(self):
+        weight = torch.randn(32, 16)
+        cache = flashpairformer._trimul_cache(weight, eps=1e-5)
+        cache["test_pack"] = object()
+        assert "test_pack" not in flashpairformer._trimul_cache(weight, eps=1e-3)
+
+    def test_retained_sources_do_not_prevent_cleanup(self, packed_trimul):
+        layer = TriangleMultiplicationOutgoing(dim=16)
+        owner = weakref.ref(layer.p_in.weight)
+        key = id(layer.p_in.weight)
+        packed_trimul(layer)
+        assert "test_sources" in flashpairformer._trimul_caches[key]
+        del layer
+        gc.collect()
+        assert owner() is None
+        assert key not in flashpairformer._trimul_caches
 
 
 class TestOptCoreInterface:

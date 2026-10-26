@@ -153,11 +153,17 @@ When `opt_core` is importable, `boltz predict` uses it by default on NVIDIA GPUs
 
 The route is limited to Boltz-2 evaluation with gradients disabled and CUDA bf16 autocast enabled. Boltz-1, training (including no-grad recycling passes), and the fp32 affinity module keep their existing kernel paths.
 
+Only calls inside `Boltz2.forward` enter this scope automatically; calling the triangle layers directly keeps the existing kernels unless you explicitly enter `boltz.model.layers.flashpairformer.inference_scope()` under the same inference conditions.
+
 Set `BOLTZ_FLASHPAIRFORMER` to choose the tier:
 
 - `fast` (default): the fastest kernels; outputs differ from cuEquivariance by bf16 rounding.
 - `exact`: only kernels that are bit-identical to cuEquivariance on a stack Anthropic measured; everything else runs cuEquivariance.
 - `off`: never use `opt_core`.
+
+Changes to `BOLTZ_FLASHPAIRFORMER` take effect on subsequent calls in the same process. After a kernel error has disabled the route, restart the process to enable it again; changing the tier does not clear that failure.
+
+Normal PyTorch parameter updates invalidate packed triangle-multiplication weights automatically. For custom weight changes that bypass version tracking (such as writes through `.data`), call `boltz.model.layers.flashpairformer.clear_weight_caches()` before predicting again. Weights created inside `torch.inference_mode()` are repacked on each call because they have no mutation counter.
 
 `--no_kernels` turns off FlashPairformer along with cuEquivariance.
 

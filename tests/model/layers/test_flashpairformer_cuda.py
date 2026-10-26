@@ -73,7 +73,6 @@ def run(
     agree and neither may turn the route off.
     """
     monkeypatch.setenv(flashpairformer.ENV_VAR, tier)
-    flashpairformer.tier.cache_clear()
     with (
         flashpairformer.inference_scope(),
         torch.no_grad(),
@@ -91,7 +90,6 @@ def fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset the route's per-process state around each test."""
     monkeypatch.setitem(flashpairformer._kernel_failure, "reason", None)  # noqa: SLF001
     yield
-    flashpairformer.tier.cache_clear()
 
 
 def inputs(num_tokens: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -154,7 +152,6 @@ def test_fp32_uses_existing_kernels(
         flashpairformer, "importlib", SimpleNamespace(import_module=unexpected_import)
     )
     monkeypatch.setenv(flashpairformer.ENV_VAR, "off")
-    flashpairformer.tier.cache_clear()
     with (
         flashpairformer.inference_scope(),
         torch.no_grad(),
@@ -162,6 +159,27 @@ def test_fp32_uses_existing_kernels(
     ):
         reference = layer(x, mask, use_kernels=True)
         monkeypatch.setenv(flashpairformer.ENV_VAR, "fast")
-        flashpairformer.tier.cache_clear()
         actual = layer(x, mask, use_kernels=True)
     assert torch.equal(actual, reference)
+
+
+@pytest.mark.parametrize(
+    "layer_cls", [TriangleMultiplicationOutgoing, TriangleMultiplicationIncoming]
+)
+def test_weight_update_matches_fresh_pack(
+    monkeypatch: pytest.MonkeyPatch, layer_cls: type
+) -> None:
+    """Changing a non-owner parameter must invalidate a real backend's pack."""
+    layer = build(layer_cls, dim=128)
+    x, mask = inputs(256, dim=128)
+    before = run(monkeypatch, layer, x, mask, "fast")
+    cache = flashpairformer._trimul_caches.get(id(layer.p_in.weight), {})
+    if not any(key != "_boltz_weight_signature" for key in cache):
+        pytest.skip("selected backend did not populate a packed-weight cache")
+    with torch.no_grad():
+        layer.g_out.weight.add_(0.2)
+    updated = run(monkeypatch, layer, x, mask, "fast")
+    flashpairformer.clear_weight_caches()
+    fresh = run(monkeypatch, layer, x, mask, "fast")
+    assert torch.equal(updated, fresh)
+    assert not torch.equal(before, updated)
