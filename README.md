@@ -163,7 +163,7 @@ Set `BOLTZ_FLASHPAIRFORMER` to choose the tier:
 
 Changes to `BOLTZ_FLASHPAIRFORMER` take effect on subsequent calls in the same process. After a kernel error has disabled the route, restart the process to enable it again; changing the tier does not clear that failure.
 
-Normal PyTorch parameter updates invalidate packed triangle-multiplication weights automatically. For custom weight changes that bypass version tracking (such as writes through `.data`), call `boltz.model.layers.flashpairformer.clear_weight_caches()` before predicting again. Weights created inside `torch.inference_mode()` are repacked on each call because they have no mutation counter.
+Normal PyTorch parameter updates invalidate packed triangle-multiplication weights automatically, including opt_core's shared native caches. For custom weight changes that bypass version tracking (such as writes through `.data`), call `boltz.model.layers.flashpairformer.clear_weight_caches()` before predicting again. Triangle multiplication with weights created inside `torch.inference_mode()` uses the existing fallback because those weights have no mutation counter.
 
 `--no_kernels` turns off FlashPairformer along with cuEquivariance.
 

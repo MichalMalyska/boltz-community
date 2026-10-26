@@ -164,22 +164,42 @@ def test_fp32_uses_existing_kernels(
 
 
 @pytest.mark.parametrize(
-    "layer_cls", [TriangleMultiplicationOutgoing, TriangleMultiplicationIncoming]
+    ("layer_cls", "num_tokens", "require_native"),
+    [
+        (TriangleMultiplicationOutgoing, 256, False),
+        (TriangleMultiplicationIncoming, 256, False),
+        pytest.param(TriangleMultiplicationOutgoing, 384, True, id="h100-native"),
+    ],
 )
 def test_weight_update_matches_fresh_pack(
-    monkeypatch: pytest.MonkeyPatch, layer_cls: type
+    monkeypatch: pytest.MonkeyPatch,
+    layer_cls: type,
+    num_tokens: int,
+    require_native: bool,
 ) -> None:
     """Changing a non-owner parameter must invalidate a real backend's pack."""
+    if require_native and "H100" not in torch.cuda.get_device_name():
+        pytest.skip("native-range regression requires an H100")
     layer = build(layer_cls, dim=128)
-    x, mask = inputs(256, dim=128)
+    x, mask = inputs(num_tokens, dim=128)
+
+    def check_served():
+        cache = flashpairformer._trimul_caches.get(id(layer.p_in.weight), {})
+        if require_native:
+            # opt_core records the final served row here, including step-asides.
+            # Selecting native then silently falling back must fail this test.
+            assert getattr(cache.get("_last"), "row", None) == "native"
+        else:
+            assert any(not str(key).startswith("_boltz_") for key in cache)
+
     before = run(monkeypatch, layer, x, mask, "fast")
-    cache = flashpairformer._trimul_caches.get(id(layer.p_in.weight), {})
-    if not any(key != "_boltz_weight_signature" for key in cache):
-        pytest.skip("selected backend did not populate a packed-weight cache")
+    check_served()
     with torch.no_grad():
         layer.g_out.weight.add_(0.2)
     updated = run(monkeypatch, layer, x, mask, "fast")
+    check_served()
     flashpairformer.clear_weight_caches()
     fresh = run(monkeypatch, layer, x, mask, "fast")
+    check_served()
     assert torch.equal(updated, fresh)
     assert not torch.equal(before, updated)

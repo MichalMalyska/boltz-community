@@ -26,6 +26,7 @@ from __future__ import annotations
 import functools
 import importlib
 import os
+import sys
 import warnings
 import weakref
 from collections.abc import Iterator
@@ -103,9 +104,9 @@ def _prepare_kernel_environment() -> None:
 
 def _kernels(x: Tensor, name: str) -> Optional[ModuleType]:
     """Return the ``opt_core.kernels`` module to try for a call on ``x``, if any."""
-    if _kernel_failure["reason"] is not None or tier() == "off":
-        return None
     if not _inference_scope.get() or torch.is_grad_enabled():
+        return None
+    if _kernel_failure["reason"] is not None or tier() == "off":
         return None
     # The measured route is CUDA bf16 autocast only. In particular, affinity's
     # explicitly disabled autocast must keep the existing fp32 implementation.
@@ -174,9 +175,22 @@ def clear_weight_caches() -> None:
     # Keep each live owner's empty slot and its existing finalizer.
     for cache in tuple(_trimul_caches.values()):
         cache.clear()
+    _clear_native_weight_caches()
 
 
-def _trimul_cache(weight: Tensor, *other_weights: Tensor, eps: float = 1e-5) -> dict:
+def _clear_native_weight_caches() -> None:
+    """Invalidate opt_core's address-keyed packs without importing the backend."""
+    native = sys.modules.get("opt_core.kernels.trimul.native")
+    if native is not None:
+        # shared_geometries includes workspace bytes after the four cache keys.
+        # Snapshot the list because payload_cache updates the geometry LRU.
+        for geometry in tuple(native.shared_geometries()):
+            native.payload_cache(*geometry[:4]).clear()
+
+
+def _trimul_cache(
+    weight: Tensor, *other_weights: Tensor, eps: float = 1e-5
+) -> Optional[dict]:
     """Reuse packs only while all source parameters and normalization agree."""
     key = id(weight)
     try:
@@ -197,16 +211,19 @@ def _trimul_cache(weight: Tensor, *other_weights: Tensor, eps: float = 1e-5) -> 
         )
     except RuntimeError:
         # Parameters created in inference_mode have no version counter. Their
-        # writes cannot be detected, so never reuse packed weights for them.
+        # writes cannot be detected, so the route cannot safely use them.
         cache = _trimul_caches.get(key)
         if cache is not None:
             cache.clear()
-        return {}
+            _clear_native_weight_caches()
+        return None
     cache = _trimul_caches.get(key)
     if cache is None:
         cache = _trimul_caches[key] = {}
         weakref.finalize(weight, _trimul_caches.pop, key, None)
     if cache.get("_boltz_weight_signature") != signature:
+        if "_boltz_weight_signature" in cache:
+            _clear_native_weight_caches()
         cache.clear()
         cache["_boltz_weight_signature"] = signature
     return cache
@@ -275,22 +292,6 @@ def triangle_multiplication(
         return None
     # Boltz packs the a and b projections as the two halves of p_in / g_in.
     d = p_in_weight.shape[0] // 2
-    # opt_core retains source tensors in its packs. Detach before slicing so
-    # retained views cannot keep the owning Parameter alive and defeat cleanup.
-    p_in = p_in_weight.detach()
-    g_in = g_in_weight.detach()
-    weights = {
-        "ln_in_w": norm_in_weight.detach(),
-        "ln_in_b": norm_in_bias.detach(),
-        "w_ap": p_in[:d],
-        "w_ag": g_in[:d],
-        "w_bp": p_in[d:],
-        "w_bg": g_in[d:],
-        "ln_out_w": norm_out_weight.detach(),
-        "ln_out_b": norm_out_bias.detach(),
-        "w_o": p_out_weight.detach(),
-        "w_og": g_out_weight.detach(),
-    }
     try:
         z = x if x.dim() == 4 else x[None]
         selection = _trimul_selection(
@@ -305,23 +306,40 @@ def triangle_multiplication(
         )
         if selection.row in trimul.STOCK_ROWS:
             return None
+        cache = _trimul_cache(
+            p_in_weight,
+            norm_in_weight,
+            norm_in_bias,
+            g_in_weight,
+            norm_out_weight,
+            norm_out_bias,
+            p_out_weight,
+            g_out_weight,
+            eps=eps,
+        )
+        if cache is None:
+            return None
+        # Detach before slicing so retained views cannot keep Parameters alive.
+        p_in, g_in = p_in_weight.detach(), g_in_weight.detach()
+        weights = {
+            "ln_in_w": norm_in_weight.detach(),
+            "ln_in_b": norm_in_bias.detach(),
+            "w_ap": p_in[:d],
+            "w_ag": g_in[:d],
+            "w_bp": p_in[d:],
+            "w_bg": g_in[d:],
+            "ln_out_w": norm_out_weight.detach(),
+            "ln_out_b": norm_out_bias.detach(),
+            "w_o": p_out_weight.detach(),
+            "w_og": g_out_weight.detach(),
+        }
         return trimul.triangle_multiplication(
             x,
             mask,
             direction=direction,
             weights=weights,
             selection=selection,
-            cache=_trimul_cache(
-                p_in_weight,
-                norm_in_weight,
-                norm_in_bias,
-                g_in_weight,
-                norm_out_weight,
-                norm_out_bias,
-                p_out_weight,
-                g_out_weight,
-                eps=eps,
-            ),
+            cache=cache,
             eps=eps,
         )
     except trimul.Refusal:

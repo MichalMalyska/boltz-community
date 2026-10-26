@@ -8,7 +8,9 @@ test_flashpairformer_cuda.py.
 
 import gc
 import importlib
+import sys
 import weakref
+import warnings
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -290,12 +292,50 @@ class TestInferenceAdmission:
             assert flashpairformer._kernels(tensor, "trimul") is None
         importer.assert_not_called()
 
+    def test_excluded_callers_do_not_read_invalid_tier(
+        self, monkeypatch, cuda_dispatch
+    ):
+        monkeypatch.setenv(flashpairformer.ENV_VAR, "invalid")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with torch.no_grad():
+                assert flashpairformer._kernels(cuda_dispatch.tensor, "triattn") is None
+            with flashpairformer.inference_scope(), torch.enable_grad():
+                assert flashpairformer._kernels(cuda_dispatch.tensor, "triattn") is None
+        assert not caught
+        cuda_dispatch.importer.assert_not_called()
+
 
 @pytest.fixture
 def packed_trimul(monkeypatch):
     """A backend that retains detached sources and packs them only on cache miss."""
 
+    calls = []
+    state = SimpleNamespace(address_keyed=False)
+    shared = {(0, 4, 16, 16): {}, (0, 8, 16, 16): {"workspace": object()}}
+    shared_packs = shared[(0, 4, 16, 16)]
+    payload_cache = Mock(side_effect=lambda *key: shared[key])
+    native = SimpleNamespace(
+        shared_geometries=lambda: [(*key, 1234) for key in shared],
+        payload_cache=payload_cache,
+    )
+    monkeypatch.setitem(sys.modules, "opt_core.kernels.trimul.native", native)
+
     def kernel(x, mask, *, weights, cache, eps, **kwargs):
+        calls.append(weights)
+        if state.address_keyed:
+            # Native payloads share a pack cache outside the caller dictionary.
+            key = tuple(
+                (k, w.data_ptr(), tuple(w.shape), w.dtype) for k, w in weights.items()
+            )
+            if key not in shared_packs:
+                shared_packs[key] = (
+                    {k: w.clone() for k, w in weights.items()},
+                    weights,
+                )
+            return x.new_tensor(
+                sum(w.sum().item() for w in shared_packs[key][0].values())
+            )
         if "test_pack" not in cache:
             cache["test_pack"] = {key: value.clone() for key, value in weights.items()}
             cache["test_sources"] = weights
@@ -335,6 +375,10 @@ def packed_trimul(monkeypatch):
                 eps=1e-5,
             )
 
+    run.calls = calls
+    run.state = state
+    run.shared = shared
+    run.payload_cache = payload_cache
     return run
 
 
@@ -347,6 +391,30 @@ class TestTriangleMultiplicationCache:
         first = flashpairformer._trimul_cache(weight)  # noqa: SLF001
         assert flashpairformer._trimul_cache(weight) is first  # noqa: SLF001
         assert flashpairformer._trimul_cache(torch.randn(64, 32)) is not first  # noqa: SLF001
+
+    def test_unchanged_weights_keep_packs(self, packed_trimul):
+        packed_trimul.state.address_keyed = True
+        layer = TriangleMultiplicationOutgoing(dim=16)
+        before = packed_trimul(layer)
+        packs = dict(packed_trimul.shared[(0, 4, 16, 16)])
+        assert torch.equal(before, packed_trimul(layer))
+        assert packed_trimul.shared[(0, 4, 16, 16)] == packs
+        packed_trimul.payload_cache.assert_not_called()
+
+    def test_clear_does_not_import_native(self, monkeypatch):
+        monkeypatch.delitem(
+            sys.modules, "opt_core.kernels.trimul.native", raising=False
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(flashpairformer.importlib, "import_module", Mock())
+            flashpairformer.clear_weight_caches()
+            flashpairformer.importlib.import_module.assert_not_called()
+        assert "opt_core.kernels.trimul.native" not in sys.modules
+
+    def test_clear_drops_all_loaded_shared_geometries(self, packed_trimul):
+        flashpairformer.clear_weight_caches()
+        assert all(not cache for cache in packed_trimul.shared.values())
+        assert packed_trimul.payload_cache.call_count == 2
 
     def test_cache_is_dropped_with_the_weight(self) -> None:
         """A layer's cache goes away when its weights do."""
@@ -379,13 +447,50 @@ class TestTriangleMultiplicationCache:
         assert torch.equal(updated, packed_trimul(layer))
         assert not torch.equal(before, updated)
 
-    def test_inference_created_weights_are_not_reused(self, packed_trimul):
-        with torch.inference_mode():
-            layer = TriangleMultiplicationOutgoing(dim=16)
+    @pytest.mark.parametrize(
+        "parameter",
+        [
+            "norm_in.weight",
+            "norm_in.bias",
+            "p_in.weight",
+            "g_in.weight",
+            "norm_out.weight",
+            "norm_out.bias",
+            "p_out.weight",
+            "g_out.weight",
+        ],
+    )
+    def test_shared_address_cache_observes_updates(self, packed_trimul, parameter):
+        packed_trimul.state.address_keyed = True
+        layer = TriangleMultiplicationOutgoing(dim=16)
         before = packed_trimul(layer)
-        with torch.inference_mode():
-            layer.norm_out.bias.add_(1)
+        with torch.no_grad():
+            dict(layer.named_parameters())[parameter].add_(1)
+        updated = packed_trimul(layer)
+        assert not torch.equal(before, updated)
+        assert packed_trimul.payload_cache.call_count == 2
+        assert not packed_trimul.shared[(0, 8, 16, 16)]
+        flashpairformer.clear_weight_caches()
+        assert torch.equal(updated, packed_trimul(layer))
+
+    def test_shared_address_cache_observes_untracked_write(self, packed_trimul):
+        packed_trimul.state.address_keyed = True
+        layer = TriangleMultiplicationOutgoing(dim=16)
+        before = packed_trimul(layer)
+        layer.g_out.weight.data.add_(1)
+        flashpairformer.clear_weight_caches()
         assert not torch.equal(before, packed_trimul(layer))
+
+    @pytest.mark.parametrize("parameter", ["p_in.weight", "g_out.weight"])
+    def test_unversioned_weights_skip_backend(self, packed_trimul, parameter):
+        layer = TriangleMultiplicationOutgoing(dim=16)
+        module_name, parameter_name = parameter.split(".")
+        module = getattr(layer, module_name)
+        with torch.inference_mode():
+            unversioned = torch.nn.Parameter(getattr(module, parameter_name).clone())
+        setattr(module, parameter_name, unversioned)
+        assert packed_trimul(layer) is None
+        assert not packed_trimul.calls
         assert id(layer.p_in.weight) not in flashpairformer._trimul_caches
 
     def test_storage_replacement_invalidates_pack(self, packed_trimul):
