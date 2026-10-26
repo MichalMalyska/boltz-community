@@ -7,6 +7,8 @@ test_flashpairformer_cuda.py.
 """
 
 import importlib
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -107,6 +109,113 @@ class TestRoute:
                 torch.cuda.OutOfMemoryError("CUDA out of memory")
             )
         assert flashpairformer._kernel_failure["reason"] is None  # noqa: SLF001
+
+
+@pytest.fixture
+def cuda_dispatch(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Exercise admission without requiring a CUDA device or importing opt_core."""
+    backend = SimpleNamespace()
+    importer = Mock(return_value=backend)
+    monkeypatch.setattr(
+        flashpairformer, "importlib", SimpleNamespace(import_module=importer)
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    monkeypatch.setattr(torch, "is_autocast_enabled", lambda: True)
+    monkeypatch.setattr(torch, "get_autocast_dtype", lambda device: torch.bfloat16)
+    return SimpleNamespace(
+        tensor=SimpleNamespace(
+            is_cuda=True, device=torch.device("cuda"), dtype=torch.float32
+        ),
+        backend=backend,
+        importer=importer,
+    )
+
+
+class TestInferenceAdmission:
+    """Only the measured Boltz-2 inference scope may reach the optional package."""
+
+    @pytest.mark.parametrize("name", ["triattn", "trimul"])
+    @pytest.mark.parametrize(
+        ("scope", "grad", "autocast", "dtype", "cuda", "capability", "accepted"),
+        [
+            (False, False, True, torch.bfloat16, True, (9, 0), False),
+            (True, True, True, torch.bfloat16, True, (9, 0), False),
+            (True, False, False, torch.bfloat16, True, (9, 0), False),
+            (True, False, True, torch.float16, True, (9, 0), False),
+            (True, False, True, torch.float32, True, (9, 0), False),
+            (True, False, True, torch.bfloat16, False, (9, 0), False),
+            (True, False, True, torch.bfloat16, True, (7, 5), False),
+            (True, False, True, torch.bfloat16, True, (9, 0), True),
+        ],
+    )
+    def test_scope_grad_and_precision(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        cuda_dispatch: SimpleNamespace,
+        name: str,
+        scope: bool,
+        grad: bool,
+        autocast: bool,
+        dtype: torch.dtype,
+        cuda: bool,
+        capability: tuple[int, int],
+        accepted: bool,
+    ) -> None:
+        monkeypatch.setattr(torch, "is_autocast_enabled", lambda: autocast)
+        monkeypatch.setattr(torch, "get_autocast_dtype", lambda device: dtype)
+        monkeypatch.setattr(
+            torch.cuda, "get_device_capability", lambda device: capability
+        )
+        cuda_dispatch.tensor.is_cuda = cuda
+        with flashpairformer.inference_scope(scope), torch.set_grad_enabled(grad):
+            result = flashpairformer._kernels(cuda_dispatch.tensor, name)
+        if accepted:
+            assert result is cuda_dispatch.backend
+            cuda_dispatch.importer.assert_called_once_with(f"opt_core.kernels.{name}")
+        else:
+            assert result is None
+            cuda_dispatch.importer.assert_not_called()
+
+    def test_boltz2_eval_enables_and_restores_scope(
+        self, cuda_dispatch: SimpleNamespace
+    ) -> None:
+        class Model(torch.nn.Module):
+            @flashpairformer.boltz2_inference
+            def forward(self) -> object:
+                return flashpairformer._kernels(cuda_dispatch.tensor, "triattn")
+
+        with torch.no_grad():
+            assert Model().eval()() is cuda_dispatch.backend
+            # An unrelated caller, including Boltz-1, is still excluded.
+            assert flashpairformer._kernels(cuda_dispatch.tensor, "triattn") is None
+
+    def test_training_no_grad_recycling_stays_excluded(
+        self, cuda_dispatch: SimpleNamespace
+    ) -> None:
+        class Model(torch.nn.Module):
+            @flashpairformer.boltz2_inference
+            def forward(self) -> object:
+                return flashpairformer._kernels(cuda_dispatch.tensor, "trimul")
+
+        with torch.no_grad(), flashpairformer.inference_scope():
+            # Model.train() must override even an enclosing evaluation scope.
+            assert Model().train()() is None
+            assert (
+                flashpairformer._kernels(cuda_dispatch.tensor, "trimul")
+                is cuda_dispatch.backend
+            )
+
+    def test_exception_restores_scope(self, cuda_dispatch: SimpleNamespace) -> None:
+        class Model(torch.nn.Module):
+            @flashpairformer.boltz2_inference
+            def forward(self) -> object:
+                raise RuntimeError("forward failed")
+
+        with torch.no_grad():
+            with pytest.raises(RuntimeError, match="forward failed"):
+                Model().eval()()
+            assert flashpairformer._kernels(cuda_dispatch.tensor, "triattn") is None
+        cuda_dispatch.importer.assert_not_called()
 
 
 class TestTriangleMultiplicationCache:

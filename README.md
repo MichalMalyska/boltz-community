@@ -151,6 +151,8 @@ pip install -e uplifting-biomolecular-modeling/common/opt_core
 
 When `opt_core` is importable, `boltz predict` uses it by default on NVIDIA GPUs with compute capability 8.0 or newer (A100, H100, and later). For each call, `opt_core` picks the kernel it measured fastest for the GPU and input size. Any call it cannot serve (an unsupported GPU or shape, a missing prebuilt binary, a kernel error) runs on cuEquivariance, and without cuEquivariance on PyTorch, as before. A kernel error disables FlashPairformer for the rest of the process with a warning.
 
+The route is limited to Boltz-2 evaluation with gradients disabled and CUDA bf16 autocast enabled. Boltz-1, training (including no-grad recycling passes), and the fp32 affinity module keep their existing kernel paths.
+
 Set `BOLTZ_FLASHPAIRFORMER` to choose the tier:
 
 - `fast` (default): the fastest kernels; outputs differ from cuEquivariance by bf16 rounding.

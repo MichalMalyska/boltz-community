@@ -11,6 +11,7 @@ installed, and are excluded from CI; run them manually:
 """
 
 import importlib.util
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -73,7 +74,11 @@ def run(
     """
     monkeypatch.setenv(flashpairformer.ENV_VAR, tier)
     flashpairformer.tier.cache_clear()
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+    with (
+        flashpairformer.inference_scope(),
+        torch.no_grad(),
+        torch.autocast("cuda", dtype=torch.bfloat16),
+    ):
         out = layer(x, mask, use_kernels=True)
         again = layer(x, mask, use_kernels=True)
     assert flashpairformer._kernel_failure["reason"] is None  # noqa: SLF001
@@ -132,3 +137,31 @@ def test_fast_is_as_close_as_cuequivariance(
         return ((out - reference).norm() / reference.norm()).item()
 
     assert rel_error(fast) <= 2 * rel_error(cueq) + 1e-3
+
+
+@pytest.mark.parametrize("layer_cls", LAYERS)
+def test_fp32_uses_existing_kernels(
+    monkeypatch: pytest.MonkeyPatch, layer_cls: type
+) -> None:
+    """The affinity module disables autocast: opt_core must not be imported."""
+    layer = build(layer_cls, dim=128)
+    x, mask = inputs(256, dim=128)
+
+    def unexpected_import(name: str) -> None:
+        pytest.fail(f"fp32 affinity-like call imported {name}")
+
+    monkeypatch.setattr(
+        flashpairformer, "importlib", SimpleNamespace(import_module=unexpected_import)
+    )
+    monkeypatch.setenv(flashpairformer.ENV_VAR, "off")
+    flashpairformer.tier.cache_clear()
+    with (
+        flashpairformer.inference_scope(),
+        torch.no_grad(),
+        torch.autocast("cuda", enabled=False),
+    ):
+        reference = layer(x, mask, use_kernels=True)
+        monkeypatch.setenv(flashpairformer.ENV_VAR, "fast")
+        flashpairformer.tier.cache_clear()
+        actual = layer(x, mask, use_kernels=True)
+    assert torch.equal(actual, reference)

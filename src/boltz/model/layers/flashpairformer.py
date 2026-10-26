@@ -28,6 +28,9 @@ import importlib
 import os
 import warnings
 import weakref
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from types import ModuleType
 from typing import Callable, Optional
 
@@ -44,6 +47,37 @@ _kernel_failure = {"reason": None}
 # opt_core's per-layer packed-weight caches, keyed by id() because tensors compare
 # elementwise, and dropped with the layer's weights.
 _trimul_caches: dict[int, dict] = {}
+
+# The triangle layers are shared with Boltz-1. Opt in only while evaluating a
+# Boltz-2 forward, rather than changing every caller that enables CUDA kernels.
+_inference_scope: ContextVar[bool] = ContextVar("boltz2_flashpairformer", default=False)
+
+
+@contextmanager
+def inference_scope(enabled: bool = True) -> Iterator[None]:
+    """Scope the route to a Boltz-2 evaluation (also used by layer-only tests)."""
+    token = _inference_scope.set(enabled)
+    try:
+        yield
+    finally:
+        _inference_scope.reset(token)
+
+
+def boltz2_inference(function: Callable) -> Callable:
+    """Enable the route for evaluation, including correct nesting and cleanup.
+
+    Checking the model's mode excludes training's no-grad recycling and
+    checkpoint passes too; checking grad mode alone would not exclude them.
+    """
+
+    @functools.wraps(function)
+    def scoped_forward(
+        model: torch.nn.Module, *args: object, **kwargs: object
+    ) -> object:
+        with inference_scope(enabled=not model.training):
+            return function(model, *args, **kwargs)
+
+    return scoped_forward
 
 
 @functools.cache
@@ -66,7 +100,15 @@ def _kernels(x: Tensor, name: str) -> Optional[ModuleType]:
     """Return the ``opt_core.kernels`` module to try for a call on ``x``, if any."""
     if _kernel_failure["reason"] is not None or tier() == "off":
         return None
-    if not x.is_cuda or torch.cuda.get_device_capability(x.device) < (8, 0):
+    if not _inference_scope.get() or torch.is_grad_enabled():
+        return None
+    # The measured route is CUDA bf16 autocast only. In particular, affinity's
+    # explicitly disabled autocast must keep the existing fp32 implementation.
+    if not x.is_cuda or not torch.is_autocast_enabled():
+        return None
+    if torch.get_autocast_dtype("cuda") != torch.bfloat16:
+        return None
+    if torch.cuda.get_device_capability(x.device) < (8, 0):
         return None
     # opt_core prints a per-process kernel census at exit unless asked not to.
     os.environ.setdefault("OPT_CORE_CELL_CENSUS_PRINT", "0")

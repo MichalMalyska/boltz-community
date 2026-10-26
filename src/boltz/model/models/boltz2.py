@@ -9,6 +9,7 @@ from torch import Tensor, nn
 from torchmetrics import MeanMetric
 
 import boltz.model.layers.initialize as init
+from boltz.model.layers import flashpairformer
 from boltz.data import const
 from boltz.data.mol import (
     minimum_lddt_symmetry_coords,
@@ -411,6 +412,7 @@ class Boltz2(LightningModule):
                 x["label"] for x in self.val_group_mapper.values()
             }, msg
 
+    @flashpairformer.boltz2_inference
     def forward(
         self,
         feats: dict[str, Tensor],
