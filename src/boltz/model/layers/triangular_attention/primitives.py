@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
-from boltz.model.layers import initialize
+from boltz.model.layers import flashpairformer, initialize
 from boltz.model.modules.utils import autocast_device_type
 from boltz.model.layers.triangular_attention.utils import (
     flatten_final_dims,
@@ -264,6 +264,9 @@ def _is_recoverable_kernel_error(error: Exception) -> bool:
 
 
 def _kernel_or_none(**kwargs: object) -> Optional[torch.Tensor]:
+    out = flashpairformer.triangle_attention(**kwargs, stock=kernel_triangular_attn)
+    if out is not None:
+        return out
     if _kernel_failure["reason"] is not None:
         return None
     try:
