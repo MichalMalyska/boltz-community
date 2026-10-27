@@ -17,10 +17,12 @@ Empty MSAs produce a denominator of one, matching zero-count clamping.
 Boltz-1 callers, training, gradient-enabled calls, CPU, compiled forwards and
 non-bf16 contexts use the existing arithmetic. The optimization needs no `opt_core` installation.
 
-The chunked OPM path releases its fp32 projections after casting and releases
-each divided chunk after its output projection. It does not retain fp32 and
+The chunked OPM path releases its normalized MSA activation after saving the
+output dtype, releases fp32 projections after casting, and releases each divided
+chunk after its output projection. It does not retain fp32 and
 bf16 projection copies throughout the loop or retain a divided chunk into the
-next iteration.
+next iteration. Only the dtype is needed from the normalized activation during
+the chunk loop; its values and device are no longer needed there.
 
 These changes adapt the work-elimination ideas in Anthropic's
 [Boltz-2 optimization bundle](https://github.com/anthropics/uplifting-biomolecular-modeling/blob/f4f62fa6592ae4938d49b1757bea0cfeff9f468e/boltz2/opt/forward/waste/boltz_waste_levers.py).
@@ -73,3 +75,11 @@ CPU and also pass with CUDA autocast. The follow-up CUDA process was capped at 4
 used about 222 MiB peak allocated memory. It shared the device with a running
 scientific process, so these runs establish correctness rather than timing.
 The review fixes' end-to-end performance has not been measured.
+
+A later normalized-activation lifetime fix passed all 26 focused CPU tests on
+PyTorch 2.4.1 and all 15 CUDA cases on the same Blackwell runtime. Its two new
+CPU lifetime cases fail on `1f9aecc`: both optimized and ordinary chunked OPM
+held the normalized activation until the loop ended. Saving its dtype allows
+the activation to be released before the first einsum. At B=1, S=1024, N=1344,
+C=64, an fp32 activation occupies 352,321,536 bytes (336 MiB). This is the size
+of the buffer released earlier, not a measured reduction in total peak memory.

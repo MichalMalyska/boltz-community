@@ -62,6 +62,8 @@ class OuterProductMean(nn.Module):
 
         # Compute outer product mean
         if chunk_size is not None and not self.training:
+            out_dtype = m.dtype
+            del m
             # Compute pairwise mask
             num_mask = msa_inference.mask_counts(raw_mask, mask)
             a_cast = msa_inference.cast_activation(a)
@@ -94,9 +96,9 @@ class OuterProductMean(nn.Module):
 
                 # Project to output
                 if i == 0:
-                    z_out = z.to(m) @ sliced_weight_proj_o.T
+                    z_out = z.to(out_dtype) @ sliced_weight_proj_o.T
                 else:
-                    z_out = z_out + z.to(m) @ sliced_weight_proj_o.T
+                    z_out = z_out + z.to(out_dtype) @ sliced_weight_proj_o.T
                 del z
 
             z_out = z_out + self.proj_o.bias  # add bias

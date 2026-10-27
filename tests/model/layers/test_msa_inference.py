@@ -204,6 +204,34 @@ def test_opm_division_matches_standard_promotion_under_autocast(mask_dtype, devi
     assert torch.equal(actual, reference)
 
 
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("reuse", [False, True])
+def test_opm_releases_normalized_input_before_chunk_loop(
+    scoped_counts, monkeypatch, device, reuse
+):
+    if not reuse:
+        monkeypatch.setattr(msa_inference, "enabled", lambda x: False)
+    refs = []
+    layer = OuterProductMean(8, 4, 8).to(device).eval()
+    layer.norm.register_forward_hook(
+        lambda module, args, output: refs.append(weakref.ref(output))
+    )
+    original_einsum = torch.einsum
+
+    def einsum(*args, **kwargs):
+        assert len(refs) == 1
+        assert refs[0]() is None
+        return original_einsum(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "einsum", einsum)
+    with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
+        layer(
+            torch.randn(1, 3, 5, 8, device=device),
+            torch.ones(1, 3, 5, device=device),
+            chunk_size=2,
+        )
+
+
 def test_decorator_restores_scope(fake_cuda):
     class Module:
         training = False
