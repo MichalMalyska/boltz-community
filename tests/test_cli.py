@@ -81,6 +81,24 @@ class TestBatchSizeOption:
             )
 
 
+@pytest.mark.parametrize("accelerator", ["cpu", "gpu"])
+def test_bad_denoiser_setting_rejected_before_prediction_setup(
+    tmp_path, monkeypatch, accelerator
+):
+    from click.testing import CliRunner
+
+    input_path = tmp_path / "input.yaml"
+    input_path.write_text("version: 1\nsequences: []\n")
+    monkeypatch.setenv("BOLTZ_DENOISER_CACHE", "typo")
+    with patch("boltz.main.download_boltz2") as download:
+        result = CliRunner().invoke(
+            predict, [str(input_path), "--accelerator", accelerator]
+        )
+    assert result.exit_code == 2
+    assert "BOLTZ_DENOISER_CACHE" in result.output
+    download.assert_not_called()
+
+
 class TestAvailableCpuCount:
     """_available_cpu_count must respect cgroup/taskset limits."""
 

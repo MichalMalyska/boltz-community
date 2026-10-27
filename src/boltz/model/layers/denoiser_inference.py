@@ -9,6 +9,17 @@ import torch
 
 logger = logging.getLogger(__name__)
 MAX_CACHE_BYTES = 128 * 1024**2
+_MISSING = object()
+
+
+def cache_enabled():
+    """Parse once at CLI startup, and once per direct sampling invocation."""
+    setting = os.environ.get("BOLTZ_DENOISER_CACHE", "off").strip().lower()
+    if setting in ("off", "0", "false"):
+        return False
+    if setting in ("on", "1", "true"):
+        return True
+    raise ValueError("BOLTZ_DENOISER_CACHE must be on/off, true/false, or 1/0")
 
 
 def _eligible(module, x):
@@ -59,6 +70,56 @@ def _storages(tensors):
     return storages
 
 
+@dataclass(eq=False)
+class _ModulePlan:
+    modules: tuple
+    owners: tuple
+    bindings: tuple
+    settings: tuple
+    parameters: tuple
+    buffers: tuple
+
+    @classmethod
+    def capture(cls, modules):
+        owners = tuple(child for m in modules for child in m.modules())
+        return cls(
+            modules,
+            owners,
+            tuple(
+                tuple(
+                    tuple(getattr(m, attr).items())
+                    for attr in ("_parameters", "_buffers", "_modules")
+                )
+                for m in owners
+            ),
+            tuple(
+                (m.__dict__.get("eps"), m.__dict__.get("normalized_shape"))
+                for m in owners
+            ),
+            tuple(p for m in modules for p in m.parameters()),
+            tuple(b for m in modules for b in m.buffers()),
+        )
+
+    def matches(self, modules):
+        if self.modules != modules:
+            return False
+        for owner, bindings, settings in zip(self.owners, self.bindings, self.settings):
+            for attr, expected in zip(
+                ("_parameters", "_buffers", "_modules"), bindings
+            ):
+                current = getattr(owner, attr)
+                if len(current) != len(expected) or any(
+                    current.get(k, _MISSING) is not v for k, v in expected
+                ):
+                    return False
+            if (
+                owner.__dict__.get("eps"),
+                owner.__dict__.get("normalized_shape"),
+            ) != settings:
+                return False
+        return True
+
+
 @dataclass
 class _Entry:
     signature: tuple
@@ -66,7 +127,7 @@ class _Entry:
     references: tuple
     storages: dict
     value_versions: tuple
-    owners: tuple
+    plan: _ModulePlan
 
 
 class SamplingCache:
@@ -82,6 +143,9 @@ class SamplingCache:
         self.hits = 0
         self.builds = 0
         self.declines = 0
+        self.declined = set()
+        self.declined_calls = 0
+        self.plan_builds = 0
         self.closed = False
 
     def _retain(self, storages):
@@ -130,29 +194,29 @@ class SamplingCache:
             return build()
         if self.closed or torch.is_grad_enabled() or any(m.training for m in modules):
             return build()
-        parameters = tuple(p for m in modules for p in m.parameters())
-        buffers = tuple(b for m in modules for b in m.buffers())
-        references = (*inputs, *parameters, *buffers)
+        if role in self.declined:
+            self.declined_calls += 1
+            return build()
+        entry = self.entries.get(role)
+        if entry is not None and entry.plan.matches(modules):
+            plan = entry.plan
+        else:
+            plan = _ModulePlan.capture(modules)
+            self.plan_builds += 1
+        references = (*inputs, *plan.parameters, *plan.buffers)
         keys = tuple(_tensor_key(t) for t in references)
         if any(k is None for k in keys):
             return build()
         device = inputs[0].device.type
         autocast = torch.is_autocast_enabled(device)
-        owners = tuple(child for m in modules for child in m.modules())
-        settings = tuple(
-            (id(m), getattr(m, "eps", None), getattr(m, "normalized_shape", None))
-            for m in owners
-        )
         signature = (
+            plan,
             keys,
-            tuple(id(p) for p in parameters),
-            settings,
             extra,
             autocast,
             torch.get_autocast_dtype(device) if autocast else None,
             torch.get_float32_matmul_precision(),
         )
-        entry = self.entries.get(role)
         if entry is not None:
             old_outputs = (
                 (entry.value,)
@@ -181,10 +245,11 @@ class SamplingCache:
         ):
             self._retain(storages)
             self.entries[role] = _Entry(
-                signature, value, references, storages, value_versions, owners
+                signature, value, references, storages, value_versions, plan
             )
         else:
             self.declines += 1
+            self.declined.add(role)
         return value
 
     def single_prefix(self, module, trunk, inputs, multiplicity):
@@ -235,6 +300,7 @@ class SamplingCache:
 
     def clear(self):
         self.entries.clear()
+        self.declined.clear()
         self.roots = ()
         self._storage_refs.clear()
         self.bytes = 0
@@ -246,7 +312,8 @@ def cache_sampling(function):
 
     @functools.wraps(function)
     def scoped(module, atom_mask, *args, **kwargs):
-        if not _eligible(module, atom_mask):
+        enabled = cache_enabled()
+        if not enabled or not _eligible(module, atom_mask):
             return function(module, atom_mask, *args, **kwargs)
         from boltz.model.modules.diffusionv2 import DiffusionModule
 
@@ -256,11 +323,6 @@ def cache_sampling(function):
             or module.score_model.training
         ):
             return function(module, atom_mask, *args, **kwargs)
-        setting = os.environ.get("BOLTZ_DENOISER_CACHE", "on").strip().lower()
-        if setting in ("off", "0"):
-            return function(module, atom_mask, *args, **kwargs)
-        if setting not in ("on", "1"):
-            raise ValueError("BOLTZ_DENOISER_CACHE must be on or off")
         if not all(
             k in kwargs for k in ("s_trunk", "s_inputs", "diffusion_conditioning")
         ):
@@ -276,10 +338,13 @@ def cache_sampling(function):
             )
         finally:
             logger.debug(
-                "Denoiser cache: hits=%d builds=%d declines=%d peak_bytes=%d",
+                "Denoiser cache: hits=%d builds=%d declines=%d "
+                "declined_calls=%d plans=%d peak_bytes=%d",
                 cache.hits,
                 cache.builds,
                 cache.declines,
+                cache.declined_calls,
+                cache.plan_builds,
                 cache.peak_bytes,
             )
             cache.clear()

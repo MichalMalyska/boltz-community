@@ -485,11 +485,7 @@ class AtomAttentionEncoder(Module):
             bias=atom_enc_bias,
             multiplicity=multiplicity,
             to_keys=to_keys,
-            **(
-                {"conditioning_cache": conditioning_cache}
-                if conditioning_cache is not None
-                else {}
-            ),
+            conditioning_cache=conditioning_cache,
         )
 
         with torch.autocast(autocast_device_type(q.device.type), enabled=False):
@@ -574,11 +570,7 @@ class AtomAttentionDecoder(Module):
             bias=atom_dec_bias,
             multiplicity=multiplicity,
             to_keys=to_keys,
-            **(
-                {"conditioning_cache": conditioning_cache}
-                if conditioning_cache is not None
-                else {}
-            ),
+            conditioning_cache=conditioning_cache,
         )
 
         r_update = self.atom_feat_to_atom_pos_update(q)

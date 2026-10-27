@@ -86,6 +86,7 @@ def _case(device, batch=1):
 def _probe(monkeypatch, device):
     # CPU cases test the real eager modules with an explicit admission mock.
     # CUDA cases keep the production admission predicate intact.
+    monkeypatch.setenv("BOLTZ_DENOISER_CACHE", "on")
     if device == "cpu":
         monkeypatch.setattr(
             caching,
@@ -303,7 +304,7 @@ def test_cpu_training_grad_and_custom_models_keep_original_path(monkeypatch):
         raise AssertionError("cache should be bypassed")
 
     monkeypatch.setattr(caching, "SamplingCache", forbidden)
-    monkeypatch.setenv("BOLTZ_DENOISER_CACHE", "invalid")
+    monkeypatch.setenv("BOLTZ_DENOISER_CACHE", "on")
     with torch.no_grad():
         sampler.sample(mask, **kwargs)  # actual CPU admission
     monkeypatch.setattr(
@@ -325,6 +326,7 @@ def test_cpu_training_grad_and_custom_models_keep_original_path(monkeypatch):
 
 def test_compiled_score_bypasses_cache(monkeypatch):
     sampler, mask, kwargs = _case("cpu")
+    monkeypatch.setenv("BOLTZ_DENOISER_CACHE", "on")
     monkeypatch.setattr(caching, "_eligible", lambda m, x: True)
     compile_fn = torch.compile
     sampler.score_model = compile_fn(
@@ -459,3 +461,104 @@ def test_precision_changes_do_not_reuse_old_modulation():
         with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
             assert torch.equal(module(a, s, conditioning_cache=cache), module(a, s))
     assert cache.builds == 3
+
+
+@pytest.mark.parametrize(
+    "value,enabled",
+    [
+        ("off", False),
+        ("0", False),
+        ("false", False),
+        ("on", True),
+        ("1", True),
+        ("true", True),
+    ],
+)
+def test_switch_boolean_aliases(monkeypatch, value, enabled):
+    monkeypatch.setenv("BOLTZ_DENOISER_CACHE", value)
+    assert caching.cache_enabled() is enabled
+
+
+def test_bad_switch_rejected_before_device_admission(monkeypatch):
+    monkeypatch.setenv("BOLTZ_DENOISER_CACHE", "typo")
+    monkeypatch.setattr(
+        caching, "_eligible", lambda *args: pytest.fail("device admission reached")
+    )
+    call = caching.cache_sampling(lambda *args: pytest.fail("sampler reached"))
+    with pytest.raises(ValueError, match="BOLTZ_DENOISER_CACHE"):
+        call(None, None)
+
+
+def test_metadata_plan_reused_without_weakening_invalidation(monkeypatch):
+    module = AdaLN(8, 8).eval()
+    count = Counter()
+    for name in ["parameters", "modules"]:
+        original = getattr(module, name)
+
+        def observed(*args, _name=name, _fn=original, **kwargs):
+            count[_name] += 1
+            return _fn(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, observed)
+    cache = caching.SamplingCache()
+    x = torch.randn(2, 3, 8)
+    with torch.no_grad():
+        for _ in range(5):
+            cache.modulation(module, x)
+        assert count == {"parameters": 1, "modules": 1}
+        module.s_scale.weight.add_(0.1)
+        cache.modulation(module, x)
+        assert cache.builds == 2 and cache.plan_builds == 1
+        module.s_norm.eps = 0.1
+        cache.modulation(module, x)
+        assert count == {"parameters": 2, "modules": 2}
+        module.s_scale.weight = torch.nn.Parameter(module.s_scale.weight.clone())
+        cache.modulation(module, x)
+        assert cache.plan_builds == 3
+
+
+def test_realistic_atom_width_saturates_budget_and_remembers_declines():
+    from boltz.model.modules.transformersv2 import DiffusionTransformerLayer
+
+    cache = caching.SamplingCache()
+    layers = [DiffusionTransformerLayer(4, 128, 128).eval() for _ in range(6)]
+    conditioning = torch.randn(1, 2048, 128)
+    with torch.inference_mode():
+        expanded = cache.repeat_conditioning(conditioning, 5).view(-1, 32, 128)
+        for layer in layers:
+            cache.modulation(layer.adaln, expanded)
+            cache.modulation(layer.transition.adaln, expanded)
+            cache.gate(layer.output_projection, expanded)
+            cache.gate(layer.transition.output_projection, expanded)
+        assert 0 < cache.peak_bytes <= 128 * 1024**2
+        assert cache.declines > 0
+        counters = cache.builds, cache.plan_builds, cache.declines
+        refused = tuple(cache.declined)
+        for role in refused:
+            if role[0] == "adaln":
+                cache.modulation(role[1], expanded)
+            else:
+                cache.gate(role[1], expanded)
+        assert counters == (cache.builds, cache.plan_builds, cache.declines)
+        assert cache.declined_calls == len(refused)
+    cache.clear()
+    assert not cache.declined and cache.bytes == 0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_sampler_partial_budget_parity(monkeypatch, device):
+    sampler, mask, kwargs = _case(device)
+    seen = _probe(monkeypatch, device)
+    monkeypatch.setattr(caching, "MAX_CACHE_BYTES", 2048)
+    with torch.inference_mode():
+        initial = _state(device)
+        monkeypatch.setenv("BOLTZ_DENOISER_CACHE", "off")
+        baseline = sampler.sample(mask, **kwargs)
+        end = _state(device)
+        _restore(initial)
+        monkeypatch.setenv("BOLTZ_DENOISER_CACHE", "on")
+        actual = sampler.sample(mask, **kwargs)
+        _assert_state(end, _state(device))
+    assert torch.equal(actual["sample_atom_coords"], baseline["sample_atom_coords"])
+    assert seen[0].hits > 0 and seen[0].declines > 0 and seen[0].declined_calls > 0
+    assert seen[0].peak_bytes <= 2048

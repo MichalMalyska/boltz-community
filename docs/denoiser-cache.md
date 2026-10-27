@@ -6,8 +6,14 @@ gradients disabled, and either fp32 execution or CUDA bf16 autocast. Compiled or
 custom score models retain their original call path. CPU, training, Boltz-1 and
 direct denoiser calls do not automatically create a cache.
 
-Set `BOLTZ_DENOISER_CACHE=off` to use the existing computation. The default is
-`on`; `0` and `1` are also accepted. The setting is read once per eligible
+The regular Boltz-2 CLI disables autocast around sampling, so its denoiser runs
+in fp32 even when the trunk uses bf16. The bf16 cache path supports direct
+library callers that enable autocast; it is not the regular CLI sampling path.
+
+Set `BOLTZ_DENOISER_CACHE=on` to opt in; the default is `off` pending performance
+validation across representative workloads. `true/false` and `1/0` are also
+accepted. Invalid values are rejected before prediction setup on CPU and GPU,
+and before any direct sampling invocation. The setting is read once per
 sampling invocation. A direct `sample` caller should use `eval()` and
 `torch.no_grad()` or `torch.inference_mode()`, as the regular prediction path does.
 
@@ -37,11 +43,20 @@ or in global tensor state. Checkpoint keys are unchanged.
 Retained tensor storage is bounded by the smaller of 128 MiB and one eighth of
 GPU free memory at admission. Accounting counts shared storage once, including
 retained source/weight references. A value that does not fit is computed normally
-without being retained; if input snapshots do not fit, the invocation uses the
+without being retained; that role is then bypassed for the remainder of the
+sampling invocation, without repeated cache validation or size accounting.
+If input snapshots do not fit, the invocation uses the
 original path. Large quadratic pair-bias expansions are not cached. All entries
 are cleared on return or exception. Exceptions, including OOM, propagate normally.
 Debug logging for `boltz.model.layers.denoiser_inference` reports hits, builds,
 budget declines and peak retained storage once per sampling invocation.
+
+The budget can fill with ordinary workloads: cached atom modulation grows with
+batch size, samples per chunk, atom count and atom width. Entries are kept at the
+original expanded batch shape to preserve numerical agreement. Metadata plans
+retain parameter/module traversal results, while lightweight binding and
+normalization-setting checks still detect replacement or configuration edits.
+Per-call tensor/version and precision checks are retained.
 
 This ports the invariant-work approach from Anthropic's pinned
 [`dit_hoist` level 1](https://github.com/anthropics/uplifting-biomolecular-modeling/blob/f4f62fa6592ae4938d49b1757bea0cfeff9f468e/boltz2/opt/forward/dit_hoist/src/boltz_dit_hoist.py)
@@ -69,11 +84,39 @@ On a three-step, two-record synthetic case with 11 samples and a cap of five,
 the fixed prefix and each observed atom normalization run twice, for the two
 chunk shapes, instead of nine times. Fourier and token normalization still run
 nine times. This establishes eliminated work, not an end-to-end speed-up.
-Full pretrained-prediction timing and accuracy validation remain outstanding.
 
-Validation on 27 October 2026: 458 tests passed on the minimum PyTorch 2.4.1
-CPU runtime (56 skipped, 11 deselected). Seven new denoiser CUDA cases and all
-15 existing MSA CUDA cases passed on RTX PRO 6000 Blackwell with PyTorch
-2.14.0+cu130. Sampling tests include fp32 and bf16 autocast with mixed-precision
-conditioning inputs. The GPU process shared the device with an existing run,
-so these results establish tested correctness rather than performance.
+On 27 October 2026, a real pretrained prediction comparison used the 846-token
+`examples/ligand.yaml` assembly on an isolated NVIDIA A10G, PyTorch
+2.12.0+cu130, FlashPairformer `fast` at the pinned `opt_core` commit above, and
+`--flash_attn`. Both modes used seed 0, three recycling steps, 200 sampling
+steps, fp32 denoising and default contact guidance, without `--use_potentials`.
+Existing hash-verified processed input, MSA and checkpoints were reused.
+
+| Samples / chunk cap | Prediction, cache off | Prediction, cache on | Prediction time saved | Sampler time saved |
+| --- | --- | --- | --- | --- |
+| 1 / 1 | 56.87 s | 56.50 s | 0.65% | 1.36% |
+| 5 / 5 | 156.44 s | 156.14 s | 0.19% | 0.25% |
+
+These are median synchronized model-prediction times, including trunk, sampling
+and confidence, with the same resident model and exact featurized batch. Model
+loading, preprocessing and result serialization are excluded. Each case had
+one warmup per mode followed by two timed repetitions per mode in balanced
+off/on/on/off order. All repetitions had identical output tensor hashes and
+CPU/CUDA RNG states within each sample-count case; coordinates and confidence
+scores had zero difference. This checks numerical agreement, not predictive
+accuracy against experimental structures.
+
+One sample retained all 26 entries (121.1 MiB). Five samples retained six entries
+(123.3 MiB), refused 20 entries once, and bypassed their bookkeeping on 3,980
+later calls. Whole-prediction peak allocated GPU memory was unchanged in these
+cases. The small gains on this one assembly and GPU do not justify enabling the
+cache globally. It remains opt-in; broader workloads and CUDA-graph integration
+need separate evaluation. Real potential-guided and affinity predictions were
+not timed.
+
+Validation of the review fixes: 470 tests passed on the minimum PyTorch 2.4.1
+CPU runtime (57 skipped, 11 deselected). Eight denoiser CUDA cases and all
+15 MSA CUDA cases passed on the isolated A10G. Sampling tests include fp32 and
+bf16 autocast, partial budgets, mixed-precision conditioning, guidance and
+uneven chunks. Formatting after validation was checked for identical Python
+ASTs against the tested source snapshot.

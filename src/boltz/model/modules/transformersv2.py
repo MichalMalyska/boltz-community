@@ -62,12 +62,7 @@ class ConditionedTransitionBlock(Module):
         s,
         conditioning_cache=None,
     ):  # -> Float['... d']:
-        cache_args = (
-            {"conditioning_cache": conditioning_cache}
-            if conditioning_cache is not None
-            else {}
-        )
-        a = self.adaln(a, s, **cache_args)
+        a = self.adaln(a, s, conditioning_cache=conditioning_cache)
         b = self.swish_gate(a) * self.a_to_b(a)
         gate = (
             self.output_projection(s)
@@ -148,11 +143,7 @@ class DiffusionTransformer(Module):
                     mask,  # Bool['b n'] | None = None
                     to_keys,
                     multiplicity,
-                    **(
-                        {"conditioning_cache": conditioning_cache}
-                        if conditioning_cache is not None
-                        else {}
-                    ),
+                    conditioning_cache=conditioning_cache,
                 )
         return a
 
@@ -202,12 +193,7 @@ class DiffusionTransformerLayer(Module):
         multiplicity=1,
         conditioning_cache=None,
     ):
-        cache_args = (
-            {"conditioning_cache": conditioning_cache}
-            if conditioning_cache is not None
-            else {}
-        )
-        b = self.adaln(a, s, **cache_args)
+        b = self.adaln(a, s, conditioning_cache=conditioning_cache)
 
         k_in = b
         if to_keys is not None:
@@ -233,7 +219,7 @@ class DiffusionTransformerLayer(Module):
         b = gate * b
 
         a = a + b
-        a = a + self.transition(a, s, **cache_args)
+        a = a + self.transition(a, s, conditioning_cache=conditioning_cache)
 
         a = self.post_lnorm(a)
         return a
@@ -288,11 +274,7 @@ class AtomTransformer(Module):
             mask=mask.float(),
             multiplicity=1, # bias term already expanded with multiplicity
             to_keys=to_keys_new,
-            **(
-                {"conditioning_cache": conditioning_cache}
-                if conditioning_cache is not None
-                else {}
-            ),
+            conditioning_cache=conditioning_cache,
         )
 
         q = q.view((B, NW * W, D))

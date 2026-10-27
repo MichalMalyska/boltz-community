@@ -479,6 +479,7 @@ N[C@@H](Cc1ccc(O)cc1)C(=O)O
 
 ## Troubleshooting
 
+ - Denoiser conditioning caching is opt-in: set `BOLTZ_DENOISER_CACHE=on` to enable it, or `off` to disable it (the default). Boolean aliases `true/false` and `1/0` are accepted. Invalid values are rejected at prediction startup on both CPU and GPU. See [denoiser caching](denoiser-cache.md) for scope and memory limits.
  - If the FlashPairformer kernels from `opt_core` misbehave, set `BOLTZ_FLASHPAIRFORMER=off` to go back to the `cuequivariance` kernels while keeping them enabled.
  - A FlashPairformer kernel error disables that route for the rest of the process. Restart the process to retry it; changing `BOLTZ_FLASHPAIRFORMER` does not reset the failure. Out-of-memory errors still propagate.
  - After modifying model weights through `.data` or another operation that bypasses PyTorch's version tracking, call `boltz.model.layers.flashpairformer.clear_weight_caches()` before predicting again. Normal version-tracked parameter updates invalidate these caches automatically.

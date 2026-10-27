@@ -180,7 +180,7 @@ class DiffusionModule(Module):
             to_keys=diffusion_conditioning["to_keys"],
             r=r_noisy,  # Float['bs m 3'],
             multiplicity=multiplicity,
-            **({"conditioning_cache": cache} if cache is not None else {}),
+            conditioning_cache=cache,
         )
 
         # Full self-attention on token level
@@ -207,7 +207,7 @@ class DiffusionModule(Module):
             feats=feats,
             multiplicity=multiplicity,
             to_keys=to_keys,
-            **({"conditioning_cache": cache} if cache is not None else {}),
+            conditioning_cache=cache,
         )
 
         return r_update

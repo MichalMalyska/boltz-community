@@ -1435,6 +1435,13 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     write_embeddings: bool,
 ) -> None:
     """Run predictions with Boltz."""
+    from boltz.model.layers.denoiser_inference import cache_enabled
+
+    try:
+        cache_enabled()
+    except ValueError as error:
+        raise click.BadParameter(str(error), param_hint="BOLTZ_DENOISER_CACHE") from error
+
     import torch
     from pytorch_lightning import Trainer, seed_everything
     from pytorch_lightning.strategies import DDPStrategy, SingleDeviceStrategy
