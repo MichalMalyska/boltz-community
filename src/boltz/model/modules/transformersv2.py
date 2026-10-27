@@ -24,8 +24,11 @@ class AdaLN(Module):
         self.s_scale = Linear(dim_single_cond, dim)
         self.s_bias = LinearNoBias(dim_single_cond, dim)
 
-    def forward(self, a, s):
+    def forward(self, a, s, conditioning_cache=None):
         a = self.a_norm(a)
+        if conditioning_cache is not None:
+            scale, bias = conditioning_cache.modulation(self, s)
+            return scale * a + bias
         s = self.s_norm(s)
         a = sigmoid(self.s_scale(s)) * a + self.s_bias(s)
         return a
@@ -57,10 +60,21 @@ class ConditionedTransitionBlock(Module):
         self,
         a,  # Float['... d']
         s,
+        conditioning_cache=None,
     ):  # -> Float['... d']:
-        a = self.adaln(a, s)
+        cache_args = (
+            {"conditioning_cache": conditioning_cache}
+            if conditioning_cache is not None
+            else {}
+        )
+        a = self.adaln(a, s, **cache_args)
         b = self.swish_gate(a) * self.a_to_b(a)
-        a = self.output_projection(s) * self.b_to_a(b)
+        gate = (
+            self.output_projection(s)
+            if conditioning_cache is None
+            else conditioning_cache.gate(self.output_projection, s)
+        )
+        a = gate * self.b_to_a(b)
 
         return a
 
@@ -102,6 +116,7 @@ class DiffusionTransformer(Module):
         mask=None,  # Bool['b n'] | None = None
         to_keys=None,
         multiplicity=1,
+        conditioning_cache=None,
     ):
         if self.pair_bias_attn:
             B, N, M, D = bias.shape
@@ -133,6 +148,11 @@ class DiffusionTransformer(Module):
                     mask,  # Bool['b n'] | None = None
                     to_keys,
                     multiplicity,
+                    **(
+                        {"conditioning_cache": conditioning_cache}
+                        if conditioning_cache is not None
+                        else {}
+                    ),
                 )
         return a
 
@@ -180,8 +200,14 @@ class DiffusionTransformerLayer(Module):
         mask=None,  # Bool['b n'] | None = None
         to_keys=None,
         multiplicity=1,
+        conditioning_cache=None,
     ):
-        b = self.adaln(a, s)
+        cache_args = (
+            {"conditioning_cache": conditioning_cache}
+            if conditioning_cache is not None
+            else {}
+        )
+        b = self.adaln(a, s, **cache_args)
 
         k_in = b
         if to_keys is not None:
@@ -199,10 +225,15 @@ class DiffusionTransformerLayer(Module):
         else:
             b = self.no_pair_bias_attn(s=b, mask=mask, k_in=k_in)
 
-        b = self.output_projection(s) * b
+        gate = (
+            self.output_projection(s)
+            if conditioning_cache is None
+            else conditioning_cache.gate(self.output_projection, s)
+        )
+        b = gate * b
 
         a = a + b
-        a = a + self.transition(a, s)
+        a = a + self.transition(a, s, **cache_args)
 
         a = self.post_lnorm(a)
         return a
@@ -232,6 +263,7 @@ class AtomTransformer(Module):
         to_keys,
         mask,  # Bool['b m'] | None = None
         multiplicity=1,
+        conditioning_cache=None,
     ):
         W = self.attn_window_queries
         H = self.attn_window_keys
@@ -256,6 +288,11 @@ class AtomTransformer(Module):
             mask=mask.float(),
             multiplicity=1, # bias term already expanded with multiplicity
             to_keys=to_keys_new,
+            **(
+                {"conditioning_cache": conditioning_cache}
+                if conditioning_cache is not None
+                else {}
+            ),
         )
 
         q = q.view((B, NW * W, D))
