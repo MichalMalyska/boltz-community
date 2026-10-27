@@ -657,6 +657,9 @@ class MSAModule(nn.Module):
         m = self.msa_proj(m)
         m = m + self.s_proj(emb).unsqueeze(1)
 
+        if chunk_size_outer_product is not None:
+            msa_mask = msa_inference.versioned_mask(msa_mask)
+
         # Perform MSA blocks
         for i in range(self.msa_blocks):
             if self.activation_checkpointing and self.training:

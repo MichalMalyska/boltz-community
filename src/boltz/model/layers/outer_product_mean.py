@@ -58,18 +58,22 @@ class OuterProductMean(nn.Module):
         projected_m = msa_inference.cast_activation(m) if reuse else m
         a = self.proj_a(projected_m) * mask
         b = self.proj_b(projected_m) * mask
+        del projected_m
 
         # Compute outer product mean
         if chunk_size is not None and not self.training:
             # Compute pairwise mask
             num_mask = msa_inference.mask_counts(raw_mask, mask)
-            a_cast = msa_inference.cast_activation(a) if reuse else a
-            b_cast = msa_inference.cast_activation(b) if reuse else b
+            a_cast = msa_inference.cast_activation(a)
+            a_was_cast = a_cast is not a
+            del a
+            b_cast = msa_inference.cast_activation(b)
+            del b
 
             # Compute squentially in chunks
             for i in range(0, self.c_hidden, chunk_size):
                 a_chunk = a_cast[:, :, :, i : i + chunk_size]
-                if a_cast is not a:
+                if a_was_cast:
                     # Match autocast's contiguous cast of each original slice.
                     a_chunk = a_chunk.contiguous()
                 sliced_weight_proj_o = self.proj_o.weight[
@@ -83,6 +87,7 @@ class OuterProductMean(nn.Module):
                     )
                     torch.div(z, num_mask.unsqueeze(-1), out=divided)
                     z = divided.reshape(*divided.shape[:3], -1)
+                    del divided
                 else:
                     z = z.reshape(*z.shape[:3], -1)
                     z = z / num_mask
@@ -92,6 +97,7 @@ class OuterProductMean(nn.Module):
                     z_out = z.to(m) @ sliced_weight_proj_o.T
                 else:
                     z_out = z_out + z.to(m) @ sliced_weight_proj_o.T
+                del z
 
             z_out = z_out + self.proj_o.bias  # add bias
             return z_out
