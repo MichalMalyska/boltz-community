@@ -83,7 +83,7 @@ Community-maintained fork of [Boltz](https://github.com/jwohlwend/boltz) with bu
 - Added structure checks to Boltz-2's `confidence_*.json`: inverted or flattened stereocentres and out-of-range bonds per model. Affinity uses the best sample that passes ([#29](https://github.com/Novel-Therapeutics/boltz-community/pull/29))
 
 **Performance improvements:**
-- Optional denoiser conditioning reuse is available with `BOLTZ_DENOISER_CACHE=on` (default `off`). It caches fixed conditioning within one sampling call; see [scope, memory limits and validation](docs/denoiser-cache.md). Use `BOLTZ_DENOISER_CACHE=off` to disable it.
+- Opt-in denoiser conditioning reuse with `BOLTZ_DENOISER_CACHE=on` (off by default): fixed conditioning is computed once per sampling call instead of at every denoising step, saving 0.2–0.65% of prediction time in one A10G test. See [scope, memory limits and validation](docs/denoiser-cache.md)
 - Triangle attention and triangle multiplication run on Anthropic's FlashPairformer kernels by default when [`opt_core`](https://github.com/anthropics/uplifting-biomolecular-modeling/tree/main/common/opt_core) is installed, with the cuEquivariance and PyTorch paths as fallbacks (see [FlashPairformer kernels](#flashpairformer-kernels))
 - Added optional FlashAttention-2 / SDPA attention via `--flash_attn`: less memory and faster on Ampere+ GPUs, numerically equivalent ([#13](https://github.com/Novel-Therapeutics/boltz-community/pull/13))
 - Checkpoints are staged on CPU before moving to the accelerator: ~1.75 s faster warm load and ~4.4 GiB less peak VRAM, for ~1 GiB more host RAM ([#16](https://github.com/Novel-Therapeutics/boltz-community/pull/16), thanks to [@corinwagen](https://github.com/corinwagen))
