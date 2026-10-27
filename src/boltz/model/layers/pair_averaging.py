@@ -2,6 +2,7 @@ import torch
 from torch import Tensor, nn
 
 import boltz.model.layers.initialize as init
+from boltz.model.layers import msa_inference
 
 
 class PairWeightedAveraging(nn.Module):
@@ -73,6 +74,8 @@ class PairWeightedAveraging(nn.Module):
 
         if chunk_heads and not self.training:
             # Compute heads sequentially
+            m = msa_inference.cast_activation(m)
+            z = msa_inference.cast_activation(z)
             o_chunks = []
             for head_idx in range(self.num_heads):
                 sliced_weight_proj_m = self.proj_m.weight[

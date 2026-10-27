@@ -3,6 +3,7 @@ from torch import Tensor, nn
 from torch.nn.functional import one_hot
 
 from boltz.data import const
+from boltz.model.layers import msa_inference
 from boltz.model.layers.outer_product_mean import OuterProductMean
 from boltz.model.layers.pair_averaging import PairWeightedAveraging
 from boltz.model.layers.pairformer import (
@@ -579,6 +580,7 @@ class MSAModule(nn.Module):
                 )
             )
 
+    @msa_inference.msa_forward
     def forward(
         self,
         z: Tensor,
