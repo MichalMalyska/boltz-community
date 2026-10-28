@@ -12,6 +12,7 @@ from torch import nn
 from torch.nn import Module
 
 import boltz.model.layers.initialize as init
+from boltz.model.layers import denoiser_inference
 from boltz.data import const
 from boltz.model.loss.diffusionv2 import (
     smooth_lddt_loss,
@@ -143,13 +144,25 @@ class DiffusionModule(Module):
         feats,
         diffusion_conditioning,
         multiplicity=1,
+        _inference_cache=None,
     ):
+        cache = denoiser_inference.active(_inference_cache, self)
         if self.activation_checkpointing and self.training:
             s, normed_fourier = torch.utils.checkpoint.checkpoint(
                 self.single_conditioner,
                 times,
                 s_trunk.repeat_interleave(multiplicity, 0),
                 s_inputs.repeat_interleave(multiplicity, 0),
+            )
+        elif cache is not None:
+            prefix = cache.single_prefix(
+                self.single_conditioner, s_trunk, s_inputs, multiplicity
+            )
+            s, normed_fourier = self.single_conditioner(
+                times,
+                s_trunk,
+                s_inputs,
+                invariant_prefix=prefix,
             )
         else:
             s, normed_fourier = self.single_conditioner(
@@ -167,6 +180,7 @@ class DiffusionModule(Module):
             to_keys=diffusion_conditioning["to_keys"],
             r=r_noisy,  # Float['bs m 3'],
             multiplicity=multiplicity,
+            conditioning_cache=cache,
         )
 
         # Full self-attention on token level
@@ -193,6 +207,7 @@ class DiffusionModule(Module):
             feats=feats,
             multiplicity=multiplicity,
             to_keys=to_keys,
+            conditioning_cache=cache,
         )
 
         return r_update
@@ -315,6 +330,7 @@ class AtomDiffusion(Module):
         sigmas = F.pad(sigmas, (0, 1), value=0.0)  # last step is sigma value of 0.
         return sigmas
 
+    @denoiser_inference.cache_sampling
     def sample(
         self,
         atom_mask,

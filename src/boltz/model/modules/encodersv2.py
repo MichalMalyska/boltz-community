@@ -159,9 +159,13 @@ class SingleConditioning(Module):
         times,  # Float[' b'],
         s_trunk,  # Float['b n ts'],
         s_inputs,  # Float['b n ts'],
+        invariant_prefix=None,
     ):  # -> Float['b n 2ts']:
-        s = torch.cat((s_trunk, s_inputs), dim=-1)
-        s = self.single_embed(self.norm_single(s))
+        if invariant_prefix is None:
+            s = torch.cat((s_trunk, s_inputs), dim=-1)
+            s = self.single_embed(self.norm_single(s))
+        else:
+            s = invariant_prefix
         if not self.disable_times:
             fourier_embed = self.fourier_embed(
                 times
@@ -456,6 +460,7 @@ class AtomAttentionEncoder(Module):
         to_keys,
         r=None,  # Float['bm m 3'],
         multiplicity=1,
+        conditioning_cache=None,
     ):
         B, N, _ = feats["ref_pos"].shape
         atom_mask = feats["atom_pad_mask"].bool()  # Bool['b m'],
@@ -466,7 +471,11 @@ class AtomAttentionEncoder(Module):
             r_to_q = self.r_to_q_trans(r)
             q = q + r_to_q
 
-        c = c.repeat_interleave(multiplicity, 0)
+        c = (
+            c.repeat_interleave(multiplicity, 0)
+            if conditioning_cache is None
+            else conditioning_cache.repeat_conditioning(c, multiplicity)
+        )
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
 
         q = self.atom_encoder(
@@ -476,6 +485,7 @@ class AtomAttentionEncoder(Module):
             bias=atom_enc_bias,
             multiplicity=multiplicity,
             to_keys=to_keys,
+            conditioning_cache=conditioning_cache,
         )
 
         with torch.autocast(autocast_device_type(q.device.type), enabled=False):
@@ -540,6 +550,7 @@ class AtomAttentionDecoder(Module):
         feats,
         to_keys,
         multiplicity=1,
+        conditioning_cache=None,
     ):
         with torch.autocast(autocast_device_type(a.device.type), enabled=False):
             atom_to_token = feats["atom_to_token"].float()
@@ -559,6 +570,7 @@ class AtomAttentionDecoder(Module):
             bias=atom_dec_bias,
             multiplicity=multiplicity,
             to_keys=to_keys,
+            conditioning_cache=conditioning_cache,
         )
 
         r_update = self.atom_feat_to_atom_pos_update(q)
