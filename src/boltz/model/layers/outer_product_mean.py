@@ -2,6 +2,7 @@ import torch
 from torch import Tensor, nn
 
 import boltz.model.layers.initialize as init
+from boltz.model.layers import msa_inference
 
 
 class OuterProductMean(nn.Module):
@@ -46,43 +47,60 @@ class OuterProductMean(nn.Module):
 
         """
         # Expand mask
+        raw_mask = mask
         mask = mask.unsqueeze(-1).to(m)
 
         # Compute projections
         m = self.norm(m)
-        a = self.proj_a(m) * mask
-        b = self.proj_b(m) * mask
+        reuse = (
+            chunk_size is not None and not self.training and msa_inference.enabled(m)
+        )
+        projected_m = msa_inference.cast_activation(m) if reuse else m
+        a = self.proj_a(projected_m) * mask
+        b = self.proj_b(projected_m) * mask
+        del projected_m
 
         # Compute outer product mean
         if chunk_size is not None and not self.training:
+            out_dtype = m.dtype
+            del m
             # Compute pairwise mask
-            for i in range(0, mask.shape[1], 64):
-                if i == 0:
-                    num_mask = (
-                        mask[:, i : i + 64, None, :] * mask[:, i : i + 64, :, None]
-                    ).sum(1)
-                else:
-                    num_mask += (
-                        mask[:, i : i + 64, None, :] * mask[:, i : i + 64, :, None]
-                    ).sum(1)
-            num_mask = num_mask.clamp(min=1)
+            num_mask = msa_inference.mask_counts(raw_mask, mask)
+            a_cast = msa_inference.cast_activation(a)
+            a_was_cast = a_cast is not a
+            del a
+            b_cast = msa_inference.cast_activation(b)
+            del b
 
             # Compute squentially in chunks
             for i in range(0, self.c_hidden, chunk_size):
-                a_chunk = a[:, :, :, i : i + chunk_size]
+                a_chunk = a_cast[:, :, :, i : i + chunk_size]
+                if a_was_cast:
+                    # Match autocast's contiguous cast of each original slice.
+                    # bf16 inputs reuse work without casting; keep their layout.
+                    a_chunk = a_chunk.contiguous()
                 sliced_weight_proj_o = self.proj_o.weight[
                     :, i * self.c_hidden : (i + chunk_size) * self.c_hidden
                 ]
 
-                z = torch.einsum("bsic,bsjd->bijcd", a_chunk, b)
-                z = z.reshape(*z.shape[:3], -1)
-                z = z / num_mask
+                z = torch.einsum("bsic,bsjd->bijcd", a_chunk, b_cast)
+                if reuse:
+                    divided = torch.empty(
+                        z.shape, dtype=torch.result_type(z, num_mask), device=z.device
+                    )
+                    torch.div(z, num_mask.unsqueeze(-1), out=divided)
+                    z = divided.reshape(*divided.shape[:3], -1)
+                    del divided
+                else:
+                    z = z.reshape(*z.shape[:3], -1)
+                    z = z / num_mask
 
                 # Project to output
                 if i == 0:
-                    z_out = z.to(m) @ sliced_weight_proj_o.T
+                    z_out = z.to(out_dtype) @ sliced_weight_proj_o.T
                 else:
-                    z_out = z_out + z.to(m) @ sliced_weight_proj_o.T
+                    z_out = z_out + z.to(out_dtype) @ sliced_weight_proj_o.T
+                del z
 
             z_out = z_out + self.proj_o.bias  # add bias
             return z_out

@@ -3,6 +3,7 @@ from typing import Optional
 from torch import Tensor, nn
 
 import boltz.model.layers.initialize as init
+from boltz.model.layers import msa_inference
 
 
 class Transition(nn.Module):
@@ -66,6 +67,7 @@ class Transition(nn.Module):
             return x
         else:
             # Compute in chunks
+            x = msa_inference.cast_activation(x)
             for i in range(0, self.hidden, chunk_size):
                 fc1_slice = self.fc1.weight[i : i + chunk_size, :]
                 fc2_slice = self.fc2.weight[i : i + chunk_size, :]
