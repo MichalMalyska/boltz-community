@@ -83,6 +83,7 @@ Community-maintained fork of [Boltz](https://github.com/jwohlwend/boltz) with bu
 - Added structure checks to Boltz-2's `confidence_*.json`: inverted or flattened stereocentres and out-of-range bonds per model. Affinity uses the best sample that passes ([#29](https://github.com/Novel-Therapeutics/boltz-community/pull/29))
 
 **Performance improvements:**
+- Triangle attention and triangle multiplication run on Anthropic's FlashPairformer kernels by default when [`opt_core`](https://github.com/anthropics/uplifting-biomolecular-modeling/tree/main/common/opt_core) is installed, with the cuEquivariance and PyTorch paths as fallbacks (see [FlashPairformer kernels](#flashpairformer-kernels))
 - Added optional FlashAttention-2 / SDPA attention via `--flash_attn`: less memory and faster on Ampere+ GPUs, numerically equivalent ([#13](https://github.com/Novel-Therapeutics/boltz-community/pull/13))
 - Checkpoints are staged on CPU before moving to the accelerator: ~1.75 s faster warm load and ~4.4 GiB less peak VRAM, for ~1 GiB more host RAM ([#16](https://github.com/Novel-Therapeutics/boltz-community/pull/16), thanks to [@corinwagen](https://github.com/corinwagen))
 - Cached molecule file reads and symmetry deserialization across samples ([b2d9e06](https://github.com/Novel-Therapeutics/boltz-community/commit/b2d9e06))
@@ -137,6 +138,37 @@ uv add boltz-community            # or: uv add "boltz-community[cuda]"
 ```
 
 If you are installing on CPU-only or non-CUDA GPU hardware, omit `[cuda]`. Note that the CPU version is significantly slower than the GPU version.
+
+### FlashPairformer kernels
+
+Anthropic's [uplifting-biomolecular-modeling](https://github.com/anthropics/uplifting-biomolecular-modeling) release includes `opt_core`, a package of FlashPairformer kernels (Triton and prebuilt CUDA) for the Pairformer's triangle attention and triangle multiplication. It is not on PyPI. Install it the way that repository documents, as an editable install from a clone, so that its prebuilt CUDA kernels are found (a regular `pip install` of `common/opt_core` leaves some of them out, and those calls then use the slower Triton kernels):
+
+```
+pip install "boltz-community[cuda]"
+git clone https://github.com/anthropics/uplifting-biomolecular-modeling.git
+git -C uplifting-biomolecular-modeling checkout f4f62fa6592ae4938d49b1757bea0cfeff9f468e
+pip install -e uplifting-biomolecular-modeling/common/opt_core
+```
+
+The adapter's API checks and A10G validation used `opt_core` 0.5.228.0 at commit [`f4f62fa6592ae4938d49b1757bea0cfeff9f468e`](https://github.com/anthropics/uplifting-biomolecular-modeling/commit/f4f62fa6592ae4938d49b1757bea0cfeff9f468e), pinned above. Native shared-cache invalidation still requires GPU validation on compute capability 9.0 (H100, H200 or GH200); the A10G results do not cover it. If installing another revision, run `TestOptCoreInterface` in `tests/model/layers/test_flashpairformer.py` to check the required APIs, including `trimul.native.shared_geometries()` and `payload_cache()`.
+
+When `opt_core` is importable, `boltz predict` uses it by default on NVIDIA GPUs with compute capability 8.0 or newer (A100, H100, and later). For each call, `opt_core` picks the kernel it measured fastest for the GPU and input size. Any call it cannot serve (an unsupported GPU or shape, a missing prebuilt binary, a kernel error) runs on cuEquivariance, and without cuEquivariance on PyTorch, as before. A kernel error disables FlashPairformer for the rest of the process with a warning.
+
+The route is limited to Boltz-2 evaluation with gradients disabled and CUDA bf16 autocast enabled. Boltz-1, training (including no-grad recycling passes), and the fp32 affinity module keep their existing kernel paths.
+
+Only calls inside `Boltz2.forward` enter this scope automatically; calling the triangle layers directly keeps the existing kernels unless you explicitly enter `boltz.model.layers.flashpairformer.inference_scope()` under the same inference conditions.
+
+Set `BOLTZ_FLASHPAIRFORMER` to choose the tier:
+
+- `fast` (default): the fastest kernels; outputs differ from cuEquivariance by bf16 rounding.
+- `exact`: only kernels that are bit-identical to cuEquivariance on a stack Anthropic measured; everything else runs cuEquivariance.
+- `off`: never use `opt_core`.
+
+Changes to `BOLTZ_FLASHPAIRFORMER` take effect on subsequent calls in the same process. After a kernel error has disabled the route, restart the process to enable it again; changing the tier does not clear that failure.
+
+Normal PyTorch parameter updates invalidate packed triangle-multiplication weights automatically, including opt_core's shared native caches. For custom weight changes that bypass version tracking (such as writes through `.data`), call `boltz.model.layers.flashpairformer.clear_weight_caches()` before predicting again. Triangle multiplication with weights created inside `torch.inference_mode()` uses the existing fallback because those weights have no mutation counter.
+
+`--no_kernels` turns off FlashPairformer along with cuEquivariance.
 
 ### Installing the bleeding-edge `main` branch
 
@@ -265,7 +297,7 @@ If you're interested in retraining the model, currently for Boltz-1 but soon for
 
 We welcome external contributions and are eager to engage with the community. Connect with us on our [Slack channel](https://boltz.bio/join-slack) to discuss advancements, share insights, and foster collaboration around Boltz-2.
 
-On recent NVIDIA GPUs, Boltz leverages the acceleration provided by [NVIDIA  cuEquivariance](https://developer.nvidia.com/cuequivariance) kernels. Boltz also runs on Tenstorrent hardware thanks to a [fork](https://github.com/moritztng/tt-boltz) by Moritz Thüning.
+On recent NVIDIA GPUs, Boltz leverages the acceleration provided by [NVIDIA  cuEquivariance](https://developer.nvidia.com/cuequivariance) kernels, and by Anthropic's FlashPairformer kernels when [`opt_core`](https://github.com/anthropics/uplifting-biomolecular-modeling) is installed. Boltz also runs on Tenstorrent hardware thanks to a [fork](https://github.com/moritztng/tt-boltz) by Moritz Thüning.
 
 ## License
 

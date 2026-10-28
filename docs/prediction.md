@@ -479,4 +479,7 @@ N[C@@H](Cc1ccc(O)cc1)C(=O)O
 
 ## Troubleshooting
 
+ - If the FlashPairformer kernels from `opt_core` misbehave, set `BOLTZ_FLASHPAIRFORMER=off` to go back to the `cuequivariance` kernels while keeping them enabled.
+ - A FlashPairformer kernel error disables that route for the rest of the process. Restart the process to retry it; changing `BOLTZ_FLASHPAIRFORMER` does not reset the failure. Out-of-memory errors still propagate.
+ - After modifying model weights through `.data` or another operation that bypasses PyTorch's version tracking, call `boltz.model.layers.flashpairformer.clear_weight_caches()` before predicting again. Normal version-tracked parameter updates invalidate these caches automatically.
  - When running on old NVIDIA GPUs, you may encounter an error related to the `cuequivariance` library. In this case, you should run the model with the `--no_kernels` flag, which will disable the use of the `cuequivariance` library and allow the model to run without it. This may result in slightly lower performance, but it will allow you to run the model on older hardware.
