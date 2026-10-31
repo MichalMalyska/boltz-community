@@ -134,6 +134,9 @@ lint.ignore = [
     "BLE001",  # Same best-effort poller
     "PTH123",  # open() vs Path.open()
     "PLW1510", # subprocess.run without explicit check=
+    "S102",    # exec() use — deliberate, to give each dynamically-registered
+               # Modal Function a genuinely distinct top-level name; see the
+               # comment above the MATRIX registration loop.
 ]
 
 [tool.ruff.lint.pyupgrade]

@@ -23,6 +23,7 @@ Volume (one file per config id). Pull them down afterwards with:
 
 import json
 import pathlib
+import re
 
 import modal
 
@@ -240,26 +241,45 @@ def run_config(cfg: dict) -> dict:
 
 
 # Registered as a bare module-level loop (not inside a helper function) so each
-# `_run` def is textually at module scope — a `for` loop doesn't introduce a new
-# scope in Python, so this satisfies Modal's "@app.function must apply to
-# functions in global scope" rule without needing serialized=True. That in turn
-# means these Functions are looked up by import path inside their container, not
-# pickled by value, so there's no local/remote Python-version coupling.
+# generated function def is textually at module scope — a `for` loop doesn't
+# introduce a new scope in Python, so this satisfies Modal's "@app.function must
+# apply to functions in global scope" rule without needing serialized=True. That
+# in turn means these Functions are looked up by import path inside their
+# container, not pickled by value, so there's no local/remote Python-version
+# coupling.
+#
+# Each config MUST get a genuinely distinct top-level function name (not just a
+# distinct Python object bound to a reused name like `_run`). A Modal container
+# re-imports this whole module to resolve which function to actually execute,
+# and it does that by name — so reusing one `def _run(...)` across every loop
+# iteration left only the *last* iteration's function reachable under that name
+# once the module finished importing. Every container ended up running the last
+# config in MATRIX regardless of which image/GPU it was actually provisioned
+# with (confirmed empirically: torch/GPU were correct — the container-level
+# config — but cfg itself, and therefore the result's reported config_id, was
+# always the last MATRIX entry). exec() with a per-config name builds a real,
+# distinctly-named top-level `def`, exactly as if each were hand-written.
 BENCHMARK_FNS: dict[str, modal.Function] = {}
 for _cfg_entry in MATRIX:
     _image = build_image(_cfg_entry["torch"], _cfg_entry["cuda"])
+    _fn_name = "_bench_" + re.sub(r"[^0-9a-zA-Z_]", "_", _cfg_entry["id"])
 
-    @app.function(
-        image=_image,
-        gpu=_cfg_entry["gpu"],
-        volumes={WEIGHTS_MOUNT: weights_volume, RESULTS_MOUNT: results_volume},
-        timeout=30 * 60,
-        name=f"bench_{_cfg_entry['id']}",
+    exec(
+        f"""
+@app.function(
+    image=_image,
+    gpu=_cfg_entry["gpu"],
+    volumes={{WEIGHTS_MOUNT: weights_volume, RESULTS_MOUNT: results_volume}},
+    timeout=30 * 60,
+    name="bench_{_cfg_entry['id']}",
+)
+def {_fn_name}(cfg: dict = _cfg_entry) -> dict:
+    return run_config(cfg)
+""",
+        globals(),
     )
-    def _run(cfg: dict = _cfg_entry) -> dict:
-        return run_config(cfg)
 
-    BENCHMARK_FNS[_cfg_entry["id"]] = _run
+    BENCHMARK_FNS[_cfg_entry["id"]] = globals()[_fn_name]
 
 
 def _print_matrix() -> None:
