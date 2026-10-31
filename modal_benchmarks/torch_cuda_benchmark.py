@@ -35,6 +35,7 @@ Volume (one file per config id). Pull them down afterwards with:
 import json
 import pathlib
 import re
+from typing import Optional
 
 import modal
 
@@ -524,11 +525,33 @@ def _print_matrix() -> None:
         "\nRun all:    modal run modal_benchmarks/torch_cuda_benchmark.py --run-all"
         "\nSmoke test: modal run modal_benchmarks/torch_cuda_benchmark.py"
         " --config-id <id> --smoke-test"
+        "\n(a config with an existing clean result is skipped and reused;"
+        " add --force to always re-run)"
     )
 
 
+def _load_existing_result(cid: str) -> Optional[dict]:
+    """Best-effort read of a prior result for `cid` from the results Volume.
+
+    Returns None on any error (no such file, a stale/partial write, a Volume
+    API hiccup) — always treated the same as "no prior result", never fatal:
+    this only ever gates an optimization (skip re-running something already
+    done), so failing open (re-run) is the safe default on the read side.
+    """
+    try:
+        results_volume.reload()
+        data = b"".join(results_volume.read_file(f"{cid}.json"))
+        return json.loads(data)
+    except Exception:
+        return None
+
+
 def _run_group(
-    cids: list[str], fns: dict[str, modal.Function] = BENCHMARK_FNS
+    cids: list[str],
+    fns: dict[str, modal.Function] = BENCHMARK_FNS,
+    *,
+    check_existing: bool = False,
+    force: bool = False,
 ) -> list[dict]:
     """Launch every id in `cids` concurrently and collect results as they finish.
 
@@ -536,17 +559,31 @@ def _run_group(
     callers that need to stay under an account-wide concurrent-GPU cap should
     pass groups sized accordingly (MATRIX is split one group per GPU type below,
     6 configs each, so --run-all never asks for more than 6 GPUs at once).
+
+    check_existing: if True, a config with a prior exit_code==0 result in the
+    results Volume is skipped (its cached result is reused) rather than
+    re-run — so running a single config as a sanity check and then --run-all
+    right after doesn't redo that same config's warmup+timed cycle for free.
+    force=True always re-runs regardless. Smoke tests don't persist results at
+    all (nothing to check), so callers only pass check_existing=True for the
+    full-benchmark path.
     """
     handles = {}
+    results = []
     for cid in cids:
         fn = fns.get(cid)
         if fn is None:
             known = ", ".join(fns)
             print(f"Unknown config id: {cid!r}. Known ids: {known}")
             continue
+        if check_existing and not force:
+            existing = _load_existing_result(cid)
+            if existing is not None and existing.get("exit_code") == 0:
+                print(f"Skipping {cid}: already have a clean result (pass --force)")
+                results.append(existing)
+                continue
         handles[cid] = fn.spawn()
 
-    results = []
     for cid, handle in handles.items():
         try:
             result = handle.get()
@@ -621,7 +658,10 @@ def _print_smoke_summary(results: list[dict]) -> None:
 
 @app.local_entrypoint()
 def main(
-    config_id: str = "", run_all: bool = False, smoke_test: bool = False
+    config_id: str = "",
+    run_all: bool = False,
+    smoke_test: bool = False,
+    force: bool = False,
 ) -> None:
     """Entrypoint for `modal run modal_benchmarks/torch_cuda_benchmark.py`.
 
@@ -630,16 +670,25 @@ def main(
     opt_core/flashpairformer all import — seconds, not minutes, so it's a cheap
     way to validate an image-build or kernel-install change before spending a
     full warmup+timed-runs cycle on it.
+
+    Full-benchmark runs (not --smoke-test) skip a config whose last result was
+    exit_code==0, reusing it instead — so e.g. sanity-checking one config with
+    --config-id and then running --run-all right after doesn't redo that one
+    config's warmup+timed cycle for free. Pass --force to always re-run
+    regardless of what's already recorded.
     """
     fns = SMOKE_FNS if smoke_test else BENCHMARK_FNS
     print_results = _print_smoke_summary if smoke_test else _print_summary
+    check_existing = not smoke_test
 
     if not config_id and not run_all:
         _print_matrix()
         return
 
     if config_id and not run_all:
-        results = _run_group([config_id], fns)
+        results = _run_group(
+            [config_id], fns, check_existing=check_existing, force=force
+        )
         print_results(results)
         return
 
@@ -653,6 +702,8 @@ def main(
     for gpu_label in gpu_order:
         group_ids = [cfg["id"] for cfg in MATRIX if cfg["gpu"] == gpu_label]
         print(f"\n### {gpu_label} group: {len(group_ids)} configs in parallel ###")
-        results.extend(_run_group(group_ids, fns))
+        results.extend(
+            _run_group(group_ids, fns, check_existing=check_existing, force=force)
+        )
 
     print_results(results)

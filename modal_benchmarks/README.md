@@ -163,13 +163,18 @@ modal run modal_benchmarks/torch_cuda_benchmark.py --config-id torch2.6.0-cu126-
 ```
 
 ```bash
-# run the entire matrix (12 configs in the default MATRIX)
+# run the entire matrix (12 configs in the default MATRIX). A config with an
+# existing exit_code==0 result in the results Volume is skipped and its
+# cached result reused instead of re-run — so sanity-checking one config with
+# --config-id first, then running --run-all, doesn't redo that one for free.
+# Pass --force to always re-run every config regardless of what's cached.
 modal run modal_benchmarks/torch_cuda_benchmark.py --run-all
 ```
 
 ```bash
 # or smoke-test the entire matrix at once (same --run-all GPU-grouped
-# parallelism, just the cheap import check instead of the full benchmark)
+# parallelism, just the cheap import check instead of the full benchmark —
+# smoke tests don't persist results, so there's nothing to skip/cache here)
 modal run modal_benchmarks/torch_cuda_benchmark.py --run-all --smoke-test
 ```
 
