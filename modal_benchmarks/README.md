@@ -53,16 +53,15 @@ Everything here is a plain Modal app — it does nothing on its own. You run the
 
 ### FlashPairformer kernels (`opt_core`)
 
-`build_image()` fetches
+`build_image()` fetches the `common/opt_core` subtree of
 [`anthropics/uplifting-biomolecular-modeling`](https://github.com/anthropics/uplifting-biomolecular-modeling)
 at the commit pinned in `OPT_CORE_COMMIT` (matching README.md's own
-"FlashPairformer kernels" setup section) and does an editable install of
-`common/opt_core`, plus the repo's `[project.optional-dependencies] cuda` extra
-(cuEquivariance) beforehand. `opt_core` needs compute capability 8.0+; both A10
-(sm_86) and H100 (sm_90) qualify. It's not on PyPI and the fetch is a public,
-unauthenticated GitHub archive download — if that repo is ever made private or
-the pinned commit goes stale, every config's image build fails identically and
-clearly, not subtly per-config.
+"FlashPairformer kernels" setup section) and does an editable install of it,
+plus the repo's `[project.optional-dependencies] cuda` extra (cuEquivariance)
+beforehand. It's not on PyPI and the fetch is a public, unauthenticated GitHub
+archive download — if that repo is ever made private or the pinned commit
+goes stale, every config's image build fails identically and clearly, not
+subtly per-config.
 
 The fetch (`_fetch_opt_core.py`) downloads the pinned commit as a GitHub
 archive tarball via plain `urllib` + `tarfile`, deliberately *not* `git clone`
@@ -70,7 +69,32 @@ archive tarball via plain `urllib` + `tarfile`, deliberately *not* `git clone`
 pinned to an EOL Debian snapshot whose `bullseye-security` packages (`git`
 included) have rotated out of the mirror and 404 on `apt-get install`. If you
 hit that same 404 anywhere else, upgrade your workspace's Image Builder
-version at <https://modal.com/settings/image-config>.
+version at <https://modal.com/settings/image-config>. It extracts only the
+`common/opt_core` subtree (streamed, member by member, with the repo-root
+prefix stripped) rather than the whole repo — the full monorepo is ~1.1GB at
+this commit; `common/opt_core` alone, the only part anything here uses, is
+~300MB.
+
+Checked directly against the pinned commit's actual source (not just the
+summary in README.md's setup section) before relying on any of this:
+`common/opt_core/pyproject.toml` declares `build-backend =
+"setuptools.build_meta"` with no runtime dependencies and ships its CUDA
+kernels as prebuilt package-data binaries, so the editable install is a plain
+setuptools operation with nothing to compile — no `git`, `nvcc`, or `gcc`
+needed in the image at all, beyond what's already there. Those binaries are
+*not* Git LFS (no `.gitattributes` under `common/opt_core`; its `.cubin` files
+are genuine multi-hundred-KB binary blobs in the tree, not LFS pointer
+stubs), so the archive-tarball fetch gets their real content, not placeholder
+text. `opt_core/__init__.py` imports nothing eagerly (PEP 562 lazy
+`__getattr__` throughout), so `import opt_core` alone — what `--smoke-test`
+checks — is cheap even without a GPU present. And its GPU-capability gate
+(`opt_core/arch.py`) labels only A100/H100/H200/B200/B300 by name in its
+`SM_CLASSES` table, but that table is explicitly documented as a reporting
+label only, not a gate (`"card names are labels for tables and reports
+only — no gate here ... derives a ... capability from a name"`); an unlisted
+card like A10 (sm_86) that's still above a lever's floor runs "uncertified"
+(engaged, just not on Anthropic's own tested-card list) rather than being
+skipped.
 
 cuEquivariance's packages are named `*_cu12` upstream, but that's attempted on
 every pin including the `cu130` ones — boltz's own fallback chain (`opt_core` →

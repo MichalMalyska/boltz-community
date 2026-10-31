@@ -157,17 +157,31 @@ CUDA_EXTRA_DEPS = [
 # kernels" setup section. Not on PyPI; installed editable from a pinned commit so
 # its prebuilt CUDA kernels are found (a plain `pip install` of the subdirectory
 # leaves some out, falling back to slower Triton kernels). Needs compute
-# capability 8.0+ — both A10 (sm_86) and H100 (sm_90) qualify.
+# capability 8.0+ (verified against opt_core's own arch.py gating logic: a card
+# not in its SM_CLASSES label table, like A10, is not excluded by that absence —
+# SM_CLASSES is a reporting label, not a gate; a lever runs "uncertified" on an
+# unlisted-but-above-floor card rather than being skipped). Both A10 (sm_86) and
+# H100 (sm_90) qualify.
 #
 # Fetched via _fetch_opt_core.py (plain urllib+tarfile, a GitHub archive
-# tarball) rather than `git clone`, deliberately avoiding any dependency on a
-# `git` binary — some Modal workspaces are still on an older/legacy Image
-# Builder version pinned to an EOL Debian snapshot whose bullseye-security
-# packages (git included) have rotated out of the mirror and 404 on
-# `apt-get install`. If that bites you elsewhere too, upgrade your workspace's
-# Image Builder version at https://modal.com/settings/image-config.
+# tarball, extracting only the common/opt_core subtree) rather than `git
+# clone`, deliberately avoiding any dependency on a `git` binary — some Modal
+# workspaces are still on an older/legacy Image Builder version pinned to an
+# EOL Debian snapshot whose bullseye-security packages (git included) have
+# rotated out of the mirror and 404 on `apt-get install`. If that bites you
+# elsewhere too, upgrade your workspace's Image Builder version at
+# https://modal.com/settings/image-config. (The full
+# uplifting-biomolecular-modeling repo is ~1.1GB at this commit; common/opt_core
+# alone, everything actually needed, is ~300MB — extracting just that subtree
+# keeps every built image smaller.) opt_core's own pyproject.toml declares
+# build-backend = "setuptools.build_meta" with no runtime dependencies and ships
+# its CUDA kernels as prebuilt package-data binaries (not git-lfs — verified:
+# no .gitattributes under common/opt_core, and its "cubin" files are
+# multi-hundred-KB binary blobs, not LFS pointer stubs), so this is a plain
+# editable setuptools install with no compiler needed at install time.
 OPT_CORE_COMMIT = "f4f62fa6592ae4938d49b1757bea0cfeff9f468e"
-OPT_CORE_CLONE_DIR = "/root/uplifting-biomolecular-modeling"
+OPT_CORE_SUBDIR = "common/opt_core"
+OPT_CORE_INSTALL_DIR = "/root/opt_core"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 REPO_MOUNT = "/root/boltz-community"
@@ -193,8 +207,9 @@ def build_image(torch_version: str, cuda_tag: str) -> modal.Image:
         .run_commands(f"pip install --no-deps -e {REPO_MOUNT}")
         .add_local_file(FETCH_OPT_CORE_SCRIPT, FETCH_OPT_CORE_MOUNT, copy=True)
         .run_commands(
-            f"python3 {FETCH_OPT_CORE_MOUNT} {OPT_CORE_COMMIT} {OPT_CORE_CLONE_DIR}",
-            f"pip install -e {OPT_CORE_CLONE_DIR}/common/opt_core",
+            f"python3 {FETCH_OPT_CORE_MOUNT} {OPT_CORE_COMMIT} "
+            f"{OPT_CORE_SUBDIR} {OPT_CORE_INSTALL_DIR}",
+            f"pip install -e {OPT_CORE_INSTALL_DIR}",
         )
         .env({"BOLTZ_CACHE": WEIGHTS_MOUNT, "TOKENIZERS_PARALLELISM": "false"})
     )
