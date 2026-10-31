@@ -417,6 +417,28 @@ class TemplateV2Module(nn.Module):
             activation_checkpointing=activation_checkpointing,
         )
 
+    def _dummy_update(self, z: Tensor, num_slots: int) -> Tensor:
+        """Return the update of a pass in which no template slot is live.
+
+        With every slot masked, ``v * template_mask`` is zero, so for finite
+        ``v`` the ReLU and the bias-free ``u_proj`` give +0.0 everywhere. The
+        template stack is skipped, but its eval-mode dropout masks are still
+        drawn, in the same order and shapes, so later random draws match.
+        """
+        B, N = z.shape[:2]  # noqa: N806
+        stack_input = z.new_empty(()).expand(B * num_slots, N, N, 1)
+        for layer in self.pairformer.layers:
+            for columnwise in (False, False, False, True):
+                get_dropout_mask(layer.dropout, stack_input, layer.training, columnwise)
+
+        device_type = autocast_device_type(z.device.type)
+        dtype = (
+            torch.get_autocast_dtype(device_type)
+            if torch.is_autocast_enabled(device_type)
+            else z.dtype
+        )
+        return z.new_zeros((B, N, N, self.u_proj.out_features), dtype=dtype)
+
     def forward(
         self,
         z: Tensor,
@@ -458,6 +480,10 @@ class TemplateV2Module(nn.Module):
         template_mask = feats["template_mask"].any(dim=2).float()
         num_templates = template_mask.sum(dim=1)
         num_templates = num_templates.clamp(min=1)
+
+        # Inputs without templates carry only dummy slots, whose update is zero
+        if not self.training and not torch.is_grad_enabled() and not template_mask.any():
+            return self._dummy_update(z, res_type.shape[1])
 
         # Compute pairwise masks
         b_cb_mask = cb_mask[:, :, :, None] * cb_mask[:, :, None, :]
