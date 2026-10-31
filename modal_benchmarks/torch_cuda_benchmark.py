@@ -23,6 +23,7 @@ Volume (one file per config id). Pull them down afterwards with:
 
 import json
 import pathlib
+import sys
 
 import modal
 
@@ -33,7 +34,16 @@ RESULTS_VOLUME_NAME = "boltz-benchmark-results"
 WEIGHTS_MOUNT = "/cache"
 RESULTS_MOUNT = "/results"
 
-PYTHON_VERSION = "3.11"
+# Each benchmark Function below is registered with `serialized=True` (see
+# register_benchmark), which pickles the function by value rather than looking it
+# up by import path in the container. Modal requires the image's Python to exactly
+# match the *local* interpreter running this script in that case, so this is tied
+# to sys.version_info rather than hardcoded — whatever Python invokes `modal run`
+# is what each image gets built with. All torch pins in MATRIX currently publish
+# wheels for cp310 through at least cp313, so this should resolve on any
+# reasonably current local Python; if yours is newer than that and a pin 404s,
+# either pin an older local Python for this one invocation or drop that pin.
+PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 # Fixed input + predict settings, identical across every config, so the only things
 # that vary run-to-run are torch version / CUDA build / GPU type.

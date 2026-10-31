@@ -50,6 +50,15 @@ and adjust `MATRIX` if a pin has gone stale.
 
 **Modal setup**: `modal token new` (or `modal setup`) once, if you haven't already.
 
+**Local Python version**: each image is registered with `serialized=True` (needed
+because the per-config Functions are created dynamically in a loop, not as
+module-level definitions), which requires the image's Python to exactly match
+whatever *local* interpreter is running `modal run` itself. `PYTHON_VERSION` in
+the script is therefore derived from `sys.version_info`, not hardcoded. All pins
+in the default `MATRIX` currently publish wheels for cp310–cp313+, so this should
+just work — but if your local Python is unusually new/old and a pin 404s at
+build time, that's the first thing to check.
+
 ## Running it
 
 ```bash
