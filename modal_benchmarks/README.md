@@ -57,6 +57,14 @@ Everything here is a plain Modal app — it does nothing on its own. You run the
   forced to -1 and both summary printers print an explicit `torch mismatch`
   line — this is not hypothetical, see `CUEQUIVARIANCE_PIN` below for the bug
   this check exists to catch.
+- Terminal output stays short for a clean config (`OK    <id>  median=...s
+  peak_mem=...MB  ok=5/5`, one line) — the full JSON (every warmup/timed run,
+  each with its own stdout/stderr tail) only prints for a config that wasn't
+  fully clean, where you actually need the detail. A failed run's tail is
+  also captured much larger (20000 chars vs. 2000 for a clean one): a short
+  tail on a failure is often just the last of many repeated warning lines
+  (cuDNN's retry/fallback warnings in particular), with the actual error
+  further back and truncated away before anyone sees it.
 
 ### FlashPairformer kernels (`opt_core`)
 
@@ -103,12 +111,18 @@ card like A10 (sm_86) that's still above a lever's floor runs "uncertified"
 (engaged, just not on Anthropic's own tested-card list) rather than being
 skipped.
 
-cuEquivariance's packages are named `*_cu12` upstream, but that's attempted on
-every pin including the `cu130` ones — boltz's own fallback chain (`opt_core` →
-cuEquivariance → plain PyTorch, logged as a `RuntimeWarning` per stage) means a
-`cu130` config that can't actually load cuEquivariance just degrades one step
-further, which is itself a valid, informative result rather than something to
-special-case around.
+Upstream splits cuEquivariance's packages by CUDA major version — `*_cu12` and
+`*_cu13` variants both exist on PyPI. `cuda_extra_deps(cuda_tag)` picks the
+matching family per config (`cu13` for a `cu130` pin, `cu12` for everything
+else). Earlier this installed the `*_cu12` family unconditionally on every
+pin, on the theory that boltz's own fallback chain (`opt_core` → cuEquivariance
+→ plain PyTorch) would make a mismatch degrade gracefully if cuEquivariance
+itself couldn't load — it does not: `*_cu12` packages pull in
+`nvidia-cublas-cu12` and friends, and mixing those into a `cu130` (CUDA 13)
+torch environment crashed `boltz predict` outright with a cuDNN "could not
+open libnvrtc" error during warmup on the `torch2.9.0-cu130-H100` config, not
+a clean fallback. Picking the matching family avoids mixing CUDA-12 and
+CUDA-13 runtime libraries in the same process.
 
 ## Before running
 

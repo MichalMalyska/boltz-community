@@ -142,34 +142,43 @@ BOLTZ_DEPS = [
 ]
 
 # The repo's own [project.optional-dependencies] "cuda" extra — cuEquivariance
-# kernels for triangle attention/multiplication. Named *_cu12 upstream; boltz's
-# own fallback chain (opt_core -> cuEquivariance -> plain PyTorch, logged as a
-# RuntimeWarning when a stage is unavailable) means this is safe to attempt on
-# every pin, cu130 included — a cu130 config just degrades one step further if
-# cuEquivariance itself turns out not to load there, which is itself a valid,
-# informative benchmark result rather than something to special-case around.
+# kernels for triangle attention/multiplication.
 #
 # Exact-pinned (not just a floor), for two reasons:
-#   1. cuequivariance_ops_torch_cu12 made `torch` a hard runtime dependency
-#      (`torch>=2.11`) starting at 0.11.1 — before that (through 0.10.0) it was
-#      test-extra-only. An unbounded `>=0.5.0` floor let pip resolve the
-#      latest (0.13.0), which then silently upgraded the exactly-pinned torch
-#      build on every config whose torch version was <2.11 to a newer,
-#      wrong-CUDA-tag default-index torch — exactly the kind of cross-
-#      contamination this benchmark exists to avoid. Confirmed via PyPI's JSON
-#      API (pypi.org isn't proxy-restricted the way github.com is) that 0.10.0
-#      keeps `torch` test-extra-only and has cp312/manylinux_x86_64 wheels.
+#   1. cuequivariance_ops_torch_cu12 (and the cu13 sibling, same pattern) made
+#      `torch` a hard runtime dependency (`torch>=2.11`) starting at 0.11.1 —
+#      before that (through 0.10.0) it was test-extra-only. An unbounded
+#      `>=0.5.0` floor let pip resolve the latest (0.13.0), which then
+#      silently upgraded the exactly-pinned torch build on every config whose
+#      torch version was <2.11 to a newer, wrong-CUDA-tag default-index torch
+#      — exactly the kind of cross-contamination this benchmark exists to
+#      avoid. Confirmed via PyPI's JSON API (pypi.org isn't proxy-restricted
+#      the way github.com is) that 0.10.0 keeps `torch` test-extra-only and
+#      has cp312/manylinux_x86_64 wheels for both the cu12 and cu13 families.
 #   2. cuEquivariance's own version should stay constant across every config
 #      anyway — it's not one of the things being compared, so letting pip
 #      silently resolve a different cuEquivariance release per torch pin would
 #      itself be an uncontrolled variable.
+#
+# Picked PER CUDA TAG (cu12 vs cu13 family), not attempted uniformly on every
+# pin: upstream splits cuequivariance_ops[_torch] by CUDA MAJOR version
+# (*_cu12 / *_cu13 suffixes, confirmed both exist on PyPI), and installing the
+# wrong family alongside a given torch build is not a graceful degradation —
+# it's a real binary incompatibility. Installing *_cu12 packages (which pull
+# in nvidia-cublas-cu12 et al.) into a cu130 (CUDA 13) torch environment
+# crashed `boltz predict` outright on the torch2.9.0-cu130-H100 config with a
+# cuDNN "could not open libnvrtc" error during warmup, not a clean fallback.
 CUEQUIVARIANCE_PIN = "0.10.0"
-CUDA_EXTRA_DEPS = [
-    f"cuequivariance=={CUEQUIVARIANCE_PIN}",
-    f"cuequivariance_ops_cu12=={CUEQUIVARIANCE_PIN}",
-    f"cuequivariance_ops_torch_cu12=={CUEQUIVARIANCE_PIN}",
-    f"cuequivariance_torch=={CUEQUIVARIANCE_PIN}",
-]
+
+
+def cuda_extra_deps(cuda_tag: str) -> list[str]:
+    cuda_major = "cu13" if cuda_tag.startswith("cu13") else "cu12"
+    return [
+        f"cuequivariance=={CUEQUIVARIANCE_PIN}",
+        f"cuequivariance_ops_{cuda_major}=={CUEQUIVARIANCE_PIN}",
+        f"cuequivariance_ops_torch_{cuda_major}=={CUEQUIVARIANCE_PIN}",
+        f"cuequivariance_torch=={CUEQUIVARIANCE_PIN}",
+    ]
 
 # Anthropic's FlashPairformer kernels (opt_core), per README.md's "FlashPairformer
 # kernels" setup section. Not on PyPI; installed editable from a pinned commit so
@@ -218,7 +227,7 @@ def build_image(torch_version: str, cuda_tag: str) -> modal.Image:
         modal.Image.debian_slim(python_version=PYTHON_VERSION)
         .pip_install(f"torch=={torch_version}", index_url=torch_index_url)
         .pip_install(*BOLTZ_DEPS)
-        .pip_install(*CUDA_EXTRA_DEPS)
+        .pip_install(*cuda_extra_deps(cuda_tag))
         .add_local_dir(
             REPO_ROOT, remote_path=REPO_MOUNT, copy=True, ignore=_ignore_from_repo
         )
@@ -240,7 +249,14 @@ results_volume = modal.Volume.from_name(RESULTS_VOLUME_NAME, create_if_missing=T
 
 
 def _run_predict_once(cmd: list[str]) -> dict:
-    """Run one `boltz predict` subprocess, timed, with peak-GPU-memory sampling."""
+    """Run one `boltz predict` subprocess, timed, with peak-GPU-memory sampling.
+
+    Captures a short output tail on success (keeps a clean run's JSON small)
+    but a much larger one on failure — a short tail on a failed run is often
+    just the last of many repeated warning lines (cuDNN's retry/fallback
+    warnings in particular print several near-identical lines), with the
+    actual error further back and truncated away before anyone gets to see it.
+    """
     import subprocess
     import threading
     import time
@@ -272,12 +288,13 @@ def _run_predict_once(cmd: list[str]) -> dict:
     stop.set()
     poller.join(timeout=2)
 
+    tail_len = 2000 if proc.returncode == 0 else 20000
     return {
         "wall_time_s": round(elapsed_s, 2),
         "peak_gpu_mem_mb": max(mem_samples_mb) if mem_samples_mb else None,
         "exit_code": proc.returncode,
-        "stdout_tail": proc.stdout[-2000:],
-        "stderr_tail": proc.stderr[-2000:],
+        "stdout_tail": proc.stdout[-tail_len:],
+        "stderr_tail": proc.stderr[-tail_len:],
     }
 
 
@@ -590,10 +607,33 @@ def _run_group(
         except Exception as e:
             print(f"FAILED to run {cid}: {e}")
             continue
-        print(f"\n=== {cid} ===")
-        print(json.dumps(result, indent=2))
+        if result.get("exit_code") == 0:
+            # One line for a clean result — the full JSON (including every
+            # warmup/timed run's stdout/stderr tail) is verbose enough across
+            # 12 configs that a real failure gets lost in it. Full detail
+            # prints only when something actually needs looking at.
+            print(f"OK    {_one_line_summary(result)}")
+        else:
+            print(f"\n=== {cid} (not clean — see below) ===")
+            print(json.dumps(result, indent=2))
         results.append(result)
     return results
+
+
+def _one_line_summary(result: dict) -> str:
+    cid = result.get("config_id", "?")
+    if "wall_time_s_median" in result:  # full-benchmark result shape
+        median = result.get("wall_time_s_median")
+        median_s = f"{median:.1f}s" if median is not None else "n/a"
+        ok = result.get("timed_runs_ok", 0)
+        total = result.get("timed_runs_total", 0)
+        ok_total = f"{ok}/{total}"
+        mem = result.get("peak_gpu_mem_mb")
+        return f"{cid}  median={median_s}  peak_mem={mem}MB  ok={ok_total}"
+    # smoke-test result shape
+    checks = ("cuequivariance_torch", "opt_core", "boltz_flashpairformer")
+    status = ", ".join(c + "=ok" for c in checks if result.get(f"{c}_import_ok"))
+    return f"{cid}  {status}"
 
 
 def _print_summary(results: list[dict]) -> None:
@@ -647,7 +687,7 @@ def _print_smoke_summary(results: list[dict]) -> None:
                 f"    torch mismatch: requested {r.get('torch_version_requested')},"
                 f" got {r.get('torch_version_actual')}"
                 " (a dependency likely pulled in a different torch build —"
-                " see CUDA_EXTRA_DEPS/CUEQUIVARIANCE_PIN in the script)"
+                " see cuda_extra_deps()/CUEQUIVARIANCE_PIN in the script)"
             )
         for c in checks:
             if r.get(f"{c}_import_ok") is False:
