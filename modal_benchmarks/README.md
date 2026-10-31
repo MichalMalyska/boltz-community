@@ -93,6 +93,16 @@ separate invocations. Pull them all down with:
 modal volume get boltz-benchmark-results / ./results
 ```
 
+Then compare them with `analyze_results.py` — prints a table (sorted by GPU then
+wall time) and, if matplotlib is available, writes a bar-chart PNG next to the
+results directory comparing wall time and peak GPU memory across configs:
+
+```bash
+python modal_benchmarks/analyze_results.py ./results
+# or, without installing matplotlib into your main environment:
+uv run --with matplotlib modal_benchmarks/analyze_results.py ./results
+```
+
 ## Notes / things you may want to change
 
 - **Cost & time**: `--run-all` as shipped runs the 12 configs (6 torch/CUDA pairs ×
