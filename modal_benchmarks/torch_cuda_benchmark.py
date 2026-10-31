@@ -1,9 +1,18 @@
 """Benchmark boltz-community `predict` across torch/CUDA/GPU combinations on Modal.
 
 Each matrix entry gets its own Modal Image (pinned torch wheel from the matching
-download.pytorch.org CUDA index) and its own Modal Function (fixed GPU type), so every
-run is isolated: a broken combination only fails that one entry, and GPU type is never
-conflated with torch/CUDA version in a single result.
+download.pytorch.org CUDA index, plus Anthropic's FlashPairformer kernels —
+`opt_core` — and cuEquivariance, both on by default per the repo's own docs) and
+its own Modal Function (fixed GPU type), so every run is isolated: a broken
+combination only fails that one entry, and GPU type is never conflated with
+torch/CUDA version in a single result.
+
+Each config runs one discarded warmup `boltz predict` call followed by
+TIMED_RUNS timed calls, all in the same container/GPU — so Triton JIT
+compilation, opt_core's measured-fastest-kernel pick, and cuDNN/cuBLAS
+autotuning only pay their one-time cost once per container (and, since A10 and
+H100 configs are always separate containers, those are naturally compiled
+separately per GPU architecture too), not once per timed call.
 
 Model weights are expected to already exist in the `boltz-weights-cache` Modal Volume
 (so no checkpoint download happens during timed runs) — see README.md if that volume
@@ -44,21 +53,33 @@ PYTHON_VERSION = "3.12"
 # Fixed input + predict settings, identical across every config, so the only things
 # that vary run-to-run are torch version / CUDA build / GPU type.
 #
-# examples/prot_custom_msa.yaml ships a precomputed MSA, so this has no network
-# dependency on the MMseqs2 server and no run-to-run MSA variance.
-BENCHMARK_INPUT_REL_PATH = "examples/prot_custom_msa.yaml"
+# examples/ligand.yaml is the repo's own documented 846-token benchmark assembly
+# (see docs/denoiser-cache.md's "27 October 2026" real-prediction comparison,
+# ~57s/run on an A10G with this exact methodology) — heavy enough that wall time
+# is dominated by actual GPU compute rather than fixed per-call overhead (a tiny
+# single-chain input was tried first and came back flat across every torch/CUDA
+# pin — all overhead, no signal). It ships a precomputed MSA
+# (examples/msa/seq1.a3m), so there's no MMseqs2-server network dependency.
+BENCHMARK_INPUT_REL_PATH = "examples/ligand.yaml"
 PREDICT_EXTRA_ARGS = [
     "--model", "boltz2",
     "--accelerator", "gpu",
     "--recycling_steps", "3",
     "--sampling_steps", "200",
     "--diffusion_samples", "1",
-    "--seed", "42",
+    "--seed", "0",
     "--override",
-    # Deliberately NOT using --flash_attn here: it's a third variable (a separate
-    # kernel/attention backend) orthogonal to the torch/CUDA comparison this is
-    # trying to isolate. Add a parallel matrix for that if you want it compared too.
+    "--flash_attn",
+    # FlashPairformer (opt_core) and cuEquivariance are installed in every image
+    # below and used by default (BOLTZ_FLASHPAIRFORMER defaults to "fast") — this
+    # benchmark intentionally reflects the repo's recommended/production kernel
+    # configuration, not a kernel-free baseline. See build_image().
 ]
+
+# A single discarded warmup call, then this many timed calls, all in the same
+# container — see the module docstring for why.
+WARMUP_RUNS = 1
+TIMED_RUNS = 5
 
 def _cfg(torch_version: str, cuda_tag: str, gpu: str) -> dict:
     return {
@@ -117,6 +138,28 @@ BOLTZ_DEPS = [
     "chembl_structure_pipeline>=1.2.2",
 ]
 
+# The repo's own [project.optional-dependencies] "cuda" extra — cuEquivariance
+# kernels for triangle attention/multiplication. Named *_cu12 upstream; boltz's
+# own fallback chain (opt_core -> cuEquivariance -> plain PyTorch, logged as a
+# RuntimeWarning when a stage is unavailable) means this is safe to attempt on
+# every pin, cu130 included — a cu130 config just degrades one step further if
+# cuEquivariance itself turns out not to load there, which is itself a valid,
+# informative benchmark result rather than something to special-case around.
+CUDA_EXTRA_DEPS = [
+    "cuequivariance_ops_cu12>=0.5.0",
+    "cuequivariance_ops_torch_cu12>=0.5.0",
+    "cuequivariance_torch>=0.5.0",
+]
+
+# Anthropic's FlashPairformer kernels (opt_core), per README.md's "FlashPairformer
+# kernels" setup section. Not on PyPI; installed editable from a pinned commit so
+# its prebuilt CUDA kernels are found (a plain `pip install` of the subdirectory
+# leaves some out, falling back to slower Triton kernels). Needs compute
+# capability 8.0+ — both A10 (sm_86) and H100 (sm_90) qualify.
+OPT_CORE_REPO_URL = "https://github.com/anthropics/uplifting-biomolecular-modeling.git"
+OPT_CORE_COMMIT = "f4f62fa6592ae4938d49b1757bea0cfeff9f468e"
+OPT_CORE_CLONE_DIR = "/root/uplifting-biomolecular-modeling"
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 REPO_MOUNT = "/root/boltz-community"
 
@@ -130,12 +173,19 @@ def build_image(torch_version: str, cuda_tag: str) -> modal.Image:
     torch_index_url = f"https://download.pytorch.org/whl/{cuda_tag}"
     return (
         modal.Image.debian_slim(python_version=PYTHON_VERSION)
+        .apt_install("git")
         .pip_install(f"torch=={torch_version}", index_url=torch_index_url)
         .pip_install(*BOLTZ_DEPS)
+        .pip_install(*CUDA_EXTRA_DEPS)
         .add_local_dir(
             REPO_ROOT, remote_path=REPO_MOUNT, copy=True, ignore=_ignore_from_repo
         )
         .run_commands(f"pip install --no-deps -e {REPO_MOUNT}")
+        .run_commands(
+            f"git clone {OPT_CORE_REPO_URL} {OPT_CORE_CLONE_DIR}",
+            f"git -C {OPT_CORE_CLONE_DIR} checkout {OPT_CORE_COMMIT}",
+            f"pip install -e {OPT_CORE_CLONE_DIR}/common/opt_core",
+        )
         .env({"BOLTZ_CACHE": WEIGHTS_MOUNT, "TOKENIZERS_PARALLELISM": "false"})
     )
 
@@ -146,8 +196,50 @@ weights_volume = modal.Volume.from_name(WEIGHTS_VOLUME_NAME)
 results_volume = modal.Volume.from_name(RESULTS_VOLUME_NAME, create_if_missing=True)
 
 
+def _run_predict_once(cmd: list[str]) -> dict:
+    """Run one `boltz predict` subprocess, timed, with peak-GPU-memory sampling."""
+    import subprocess
+    import threading
+    import time
+
+    mem_samples_mb = []
+    stop = threading.Event()
+
+    def poll_gpu_mem() -> None:
+        while not stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    text=True,
+                )
+                mem_samples_mb.append(max(int(v) for v in out.strip().splitlines()))
+            except Exception:
+                pass
+            stop.wait(0.2)
+
+    poller = threading.Thread(target=poll_gpu_mem, daemon=True)
+    poller.start()
+    t0 = time.perf_counter()
+    proc = subprocess.run(cmd, cwd=REPO_MOUNT, capture_output=True, text=True)
+    elapsed_s = time.perf_counter() - t0
+    stop.set()
+    poller.join(timeout=2)
+
+    return {
+        "wall_time_s": round(elapsed_s, 2),
+        "peak_gpu_mem_mb": max(mem_samples_mb) if mem_samples_mb else None,
+        "exit_code": proc.returncode,
+        "stdout_tail": proc.stdout[-2000:],
+        "stderr_tail": proc.stderr[-2000:],
+    }
+
+
 def run_config(cfg: dict) -> dict:
-    """Run inside the Modal container: time `boltz predict`, sample peak GPU memory.
+    """Run inside the Modal container: warmup + TIMED_RUNS timed `boltz predict`s.
 
     Everything is wrapped in a broad try/except that only ever stores plain
     str/int/float/None values into `result`. A raw exception propagating out of a
@@ -158,9 +250,7 @@ def run_config(cfg: dict) -> dict:
     was never installed locally. Reporting failures as plain data instead avoids
     that regardless of what actually went wrong inside the container.
     """
-    import subprocess
-    import threading
-    import time
+    import statistics
     import traceback
 
     result: dict = {
@@ -182,50 +272,45 @@ def run_config(cfg: dict) -> dict:
         except Exception as e:
             result["gpu_name_actual"] = f"<error: {e}>"
 
-        mem_samples_mb = []
-        stop = threading.Event()
-
-        def poll_gpu_mem() -> None:
-            while not stop.is_set():
-                try:
-                    out = subprocess.check_output(
-                        [
-                            "nvidia-smi",
-                            "--query-gpu=memory.used",
-                            "--format=csv,noheader,nounits",
-                        ],
-                        text=True,
-                    )
-                    mem_samples_mb.append(
-                        max(int(v) for v in out.strip().splitlines())
-                    )
-                except Exception:
-                    pass
-                stop.wait(0.2)
-
-        out_dir = "/tmp/boltz_out"
         cmd = [
             "boltz", "predict", f"{REPO_MOUNT}/{BENCHMARK_INPUT_REL_PATH}",
-            "--out_dir", out_dir,
+            "--out_dir", "/tmp/boltz_out",
             "--cache", WEIGHTS_MOUNT,
             *PREDICT_EXTRA_ARGS,
         ]
 
-        poller = threading.Thread(target=poll_gpu_mem, daemon=True)
-        poller.start()
-        t0 = time.perf_counter()
-        proc = subprocess.run(cmd, cwd=REPO_MOUNT, capture_output=True, text=True)
-        elapsed_s = time.perf_counter() - t0
-        stop.set()
-        poller.join(timeout=2)
+        warmup_runs = [_run_predict_once(cmd) for _ in range(WARMUP_RUNS)]
+        result["warmup_runs"] = warmup_runs
 
+        timed_runs = [_run_predict_once(cmd) for _ in range(TIMED_RUNS)]
+        result["timed_runs"] = timed_runs
+
+        ok_times = [r["wall_time_s"] for r in timed_runs if r["exit_code"] == 0]
+        ok_mem = [
+            r["peak_gpu_mem_mb"]
+            for r in timed_runs
+            if r["exit_code"] == 0 and r["peak_gpu_mem_mb"] is not None
+        ]
         result.update(
             {
-                "wall_time_s": round(elapsed_s, 2),
-                "peak_gpu_mem_mb": max(mem_samples_mb) if mem_samples_mb else None,
-                "exit_code": proc.returncode,
-                "stdout_tail": proc.stdout[-4000:],
-                "stderr_tail": proc.stderr[-4000:],
+                "timed_runs_ok": len(ok_times),
+                "timed_runs_total": len(timed_runs),
+                "wall_time_s_mean": round(statistics.mean(ok_times), 2)
+                if ok_times
+                else None,
+                "wall_time_s_median": round(statistics.median(ok_times), 2)
+                if ok_times
+                else None,
+                "wall_time_s_stdev": round(statistics.stdev(ok_times), 2)
+                if len(ok_times) > 1
+                else None,
+                "wall_time_s_min": min(ok_times) if ok_times else None,
+                "wall_time_s_max": max(ok_times) if ok_times else None,
+                "peak_gpu_mem_mb": max(ok_mem) if ok_mem else None,
+                # exit_code reflects the run as a whole: 0 only if every timed
+                # run succeeded, so a sweep summary can tell "fully clean" apart
+                # from "some repeats failed" at a glance.
+                "exit_code": 0 if len(ok_times) == len(timed_runs) else -1,
             }
         )
     except Exception as e:
@@ -270,7 +355,11 @@ for _cfg_entry in MATRIX:
     image=_image,
     gpu=_cfg_entry["gpu"],
     volumes={{WEIGHTS_MOUNT: weights_volume, RESULTS_MOUNT: results_volume}},
-    timeout=30 * 60,
+    # 1 warmup + {TIMED_RUNS} timed runs on a ~57s/run (A10, per the repo's own
+    # docs/denoiser-cache.md measurement) heavier input, plus opt_core/
+    # cuEquivariance build time on first use — generous headroom for slower
+    # torch/CUDA pins.
+    timeout=60 * 60,
     name="bench_{_cfg_entry['id']}",
 )
 def {_fn_name}(cfg: dict = _cfg_entry) -> dict:
@@ -332,15 +421,21 @@ def _print_summary(results: list[dict]) -> None:
         return
     print("\n=== Summary ===")
     header = (
-        f"{'config':28s} {'wall_time_s':>12s} {'peak_gpu_mem_mb':>15s} {'exit':>5s}"
+        f"{'config':28s} {'median_s':>9s} {'mean_s':>9s} {'stdev_s':>8s} "
+        f"{'peak_mem_mb':>12s} {'ok/total':>9s}"
     )
     print(header)
     for r in results:
-        wall_time = r.get("wall_time_s")
-        wall_time_str = f"{wall_time:.1f}" if wall_time is not None else "n/a"
+        median = r.get("wall_time_s_median")
+        mean = r.get("wall_time_s_mean")
+        stdev = r.get("wall_time_s_stdev")
+        median_s = f"{median:.1f}" if median is not None else "n/a"
+        mean_s = f"{mean:.1f}" if mean is not None else "n/a"
+        stdev_s = f"{stdev:.1f}" if stdev is not None else "n/a"
+        ok_total = f"{r.get('timed_runs_ok', 0)}/{r.get('timed_runs_total', 0)}"
         print(
-            f"{r['config_id']:28s} {wall_time_str:>12s} "
-            f"{r.get('peak_gpu_mem_mb')!s:>15s} {r.get('exit_code', -1):5d}"
+            f"{r.get('config_id', '?'):28s} {median_s:>9s} {mean_s:>9s} "
+            f"{stdev_s:>8s} {r.get('peak_gpu_mem_mb')!s:>12s} {ok_total:>9s}"
         )
 
 

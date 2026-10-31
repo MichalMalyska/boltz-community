@@ -11,21 +11,38 @@ Everything here is a plain Modal app — it does nothing on its own. You run the
 
 - `torch_cuda_benchmark.py` defines one Modal `Image` + `Function` per matrix entry.
   Each image pins a specific torch build (installed with `--index-url
-  https://download.pytorch.org/whl/<cuda-tag>`) and bakes in this repo's source
-  (`pip install --no-deps -e .`), so every config is a fully isolated environment —
-  a broken combo only fails that one entry.
-- Each run executes `boltz predict examples/prot_custom_msa.yaml ...` with fixed
-  settings (seed, recycling/sampling steps, diffusion samples — see
-  `PREDICT_EXTRA_ARGS`) so the **only** things that vary between runs are torch
+  https://download.pytorch.org/whl/<cuda-tag>`), installs cuEquivariance and
+  Anthropic's FlashPairformer kernels (`opt_core` — see below), and bakes in this
+  repo's source (`pip install --no-deps -e .`), so every config is a fully
+  isolated environment — a broken combo only fails that one entry.
+- Each run executes `boltz predict examples/ligand.yaml ...` — the repo's own
+  846-token documented benchmark assembly (see docs/denoiser-cache.md) — with
+  fixed settings (seed, recycling/sampling steps, `--flash_attn` — see
+  `PREDICT_EXTRA_ARGS`) so the **only** things that vary between configs are torch
   version, CUDA build, and GPU type. The input uses a precomputed MSA
-  (`examples/msa/seq2.a3m`), so there's no MMseqs2-server network variance either.
-- Deliberately *not* varying `--flash_attn` in this matrix — that's a separate
-  attention-kernel toggle, orthogonal to the torch/CUDA comparison. Add a parallel
-  matrix for that if you want it compared too (`scripts/benchmark_flash_attn.py`
-  already does a narrower version of that, independent of this tool).
-- GPU memory is sampled via `nvidia-smi` every 200ms during the run (peak reported);
-  wall time wraps the `boltz predict` subprocess only (not image build / weight
-  staging).
+  (`examples/msa/seq1.a3m`), so there's no MMseqs2-server network variance either.
+  (An earlier, much smaller single-chain input was tried first and came back flat
+  across every pin — wall time was all fixed per-call overhead, no compute signal.)
+- **FlashPairformer / cuEquivariance kernels are on, not a variable.** This
+  benchmark intentionally reflects the repo's recommended/production kernel
+  configuration (`BOLTZ_FLASHPAIRFORMER` defaults to `fast`) on every config, not
+  a kernel-free baseline — see `build_image()`'s `opt_core` install step. If you
+  want kernels-on vs kernels-off as a separate axis, that's a different, narrower
+  comparison; `scripts/benchmark_flash_attn.py` already does an isolated version
+  of that independent of this tool.
+- Each config runs `WARMUP_RUNS` (1) discarded warmup call followed by
+  `TIMED_RUNS` (5) timed calls of `boltz predict`, all in the same
+  container/GPU — so one-time costs (Triton JIT compilation, opt_core's
+  measured-fastest-kernel pick, cuDNN/cuBLAS autotuning) only pay once per
+  container rather than once per timed call, and don't bleed into the reported
+  numbers. A10 and H100 configs are always separate containers, so their kernels
+  are naturally compiled separately per architecture too — nothing extra needed
+  for that. The result records every individual run's timing plus
+  mean/median/stdev/min/max across the timed ones.
+- GPU memory is sampled via `nvidia-smi` every 200ms during each run (peak over
+  the successful timed runs is reported); each run's wall time wraps its
+  `boltz predict` subprocess only (not image build / weight staging / the
+  warmup call).
 - A failure inside a run (driver issue, OOM, `boltz predict` crashing, etc.) is
   caught inside the container and returned as a plain dict (`exit_code: -1`,
   `error`, `traceback` strings) rather than raised — a raw exception referencing
@@ -33,6 +50,25 @@ Everything here is a plain Modal app — it does nothing on its own. You run the
   installed there, so letting one escape uncaught would kill the whole run with
   an opaque "module not available in the local environment" error instead of
   telling you what actually went wrong.
+
+### FlashPairformer kernels (`opt_core`)
+
+`build_image()` clones
+[`anthropics/uplifting-biomolecular-modeling`](https://github.com/anthropics/uplifting-biomolecular-modeling)
+at the commit pinned in `OPT_CORE_COMMIT` (matching README.md's own
+"FlashPairformer kernels" setup section) and does an editable install of
+`common/opt_core`, plus the repo's `[project.optional-dependencies] cuda` extra
+(cuEquivariance) beforehand. `opt_core` needs compute capability 8.0+; both A10
+(sm_86) and H100 (sm_90) qualify. It's not on PyPI and the clone is public — if
+that repo is ever made private or the pinned commit goes stale, every config's
+image build fails identically and clearly, not subtly per-config.
+
+cuEquivariance's packages are named `*_cu12` upstream, but that's attempted on
+every pin including the `cu130` ones — boltz's own fallback chain (`opt_core` →
+cuEquivariance → plain PyTorch, logged as a `RuntimeWarning` per stage) means a
+`cu130` config that can't actually load cuEquivariance just degrades one step
+further, which is itself a valid, informative result rather than something to
+special-case around.
 
 ## Before running
 
@@ -105,25 +141,29 @@ uv run --with matplotlib modal_benchmarks/analyze_results.py ./results
 
 ## Notes / things you may want to change
 
-- **Cost & time**: `--run-all` as shipped runs the 12 configs (6 torch/CUDA pairs ×
-  2 GPU types: A10 and H100, using `H100!` to pin the exact SKU and avoid Modal's
+- **Cost & time**: `--run-all` as shipped runs 12 configs (6 torch/CUDA pairs × 2
+  GPU types: A10 and H100, using `H100!` to pin the exact SKU and avoid Modal's
   silent H100→H200 auto-upgrade) in two sequential batches — all 6 A10 configs in
   parallel, then all 6 H100 configs in parallel — so it never asks for more than 6
   concurrent GPUs. If your account's concurrent-GPU limit is lower than 6, either
   trim `MATRIX` or split a batch further by calling `_run_group()` on a smaller
-  list from `main()`. First call per *image* also pays a one-time build cost
-  (installing torch + rdkit + friends).
+  list from `main()`. Per config: 1 warmup + 5 timed `boltz predict` calls on the
+  846-token assembly, each ~57s on an A10 per the repo's own documented
+  measurement (faster on H100) — so each config is roughly 6×that, plus a
+  one-time image-build cost per *image* (torch, rdkit, cuEquivariance, cloning
+  and building `opt_core`). Budget accordingly; this is a materially more
+  expensive sweep than a toy single-chain input would be.
 - **GPU string naming**: Modal's current supported GPU strings are things like `T4`,
   `L4`, `A10`, `L40S`, `A100-40GB`, `A100-80GB`, `H100`/`H100!`, `H200`, `B200`. There
   is no `A10G` — that's an AWS EC2 instance-family name, not a Modal GPU spec; `A10`
   is the equivalent here.
-- **Editing the workload**: `BENCHMARK_INPUT_REL_PATH` and `PREDICT_EXTRA_ARGS` at the
-  top of `torch_cuda_benchmark.py` control what gets benchmarked (currently a single
-  118-residue chain, boltz2, 200 sampling steps, 1 diffusion sample). Swap in a bigger
-  complex from `examples/` for a heavier/more realistic workload — just make sure
-  whatever you pick doesn't need `--use_msa_server` if you want network-variance-free
-  timing.
+- **Editing the workload**: `BENCHMARK_INPUT_REL_PATH`, `PREDICT_EXTRA_ARGS`,
+  `WARMUP_RUNS` and `TIMED_RUNS` at the top of `torch_cuda_benchmark.py` control
+  what gets benchmarked and how many repeats. Swap in a different complex from
+  `examples/` if you want a different workload — just make sure whatever you pick
+  doesn't need `--use_msa_server` if you want network-variance-free timing.
 - **Dependency pins**: `BOLTZ_DEPS` in the script is a copy of this repo's
   `[project.dependencies]` from `pyproject.toml` with `torch` removed (torch is
-  pinned per-config instead). If `pyproject.toml`'s dependency list changes, update
-  `BOLTZ_DEPS` to match.
+  pinned per-config instead), and `CUDA_EXTRA_DEPS` mirrors the `cuda` optional-
+  dependencies group. If either list in `pyproject.toml` changes, update the
+  matching constant here.
