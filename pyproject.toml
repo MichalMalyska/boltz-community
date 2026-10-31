@@ -134,6 +134,8 @@ lint.ignore = [
     "BLE001",  # Same best-effort poller
     "PTH123",  # open() vs Path.open()
     "PLW1510", # subprocess.run without explicit check=
+    "PERF203", # try/except in a loop — a 3-iteration import-check loop, not a
+               # hot path worth restructuring for this micro-optimization
     "S102",    # exec() use — deliberate, to give each dynamically-registered
                # Modal Function a genuinely distinct top-level name; see the
                # comment above the MATRIX registration loop.

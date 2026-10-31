@@ -23,6 +23,8 @@ Usage (run locally; Modal CLI must be set up with `modal token new` / `modal set
     modal run modal_benchmarks/torch_cuda_benchmark.py                   # list configs
     modal run modal_benchmarks/torch_cuda_benchmark.py --config-id <id>  # run one
     modal run modal_benchmarks/torch_cuda_benchmark.py --run-all         # run matrix
+    modal run modal_benchmarks/torch_cuda_benchmark.py --config-id <id> --smoke-test
+        # ^ cheap image/kernel-import check only, no boltz predict call
 
 Results are printed to stdout and persisted as JSON in the `boltz-benchmark-results`
 Volume (one file per config id). Pull them down afterwards with:
@@ -333,6 +335,57 @@ def run_config(cfg: dict) -> dict:
     return result
 
 
+def run_smoke_test(cfg: dict) -> dict:
+    """Cheap image/kernel check: imports only, no `boltz predict` call.
+
+    Seconds of image-build-plus-import-check instead of minutes of warmup+timed
+    predict runs — use this to validate that a torch/CUDA/kernel combination
+    actually builds and imports before spending a full run_config() cycle on it.
+    """
+    import traceback
+
+    result: dict = {
+        "config_id": cfg["id"],
+        "torch_version_requested": cfg["torch"],
+        "cuda_tag_requested": cfg["cuda"],
+        "gpu_requested": cfg["gpu"],
+    }
+
+    try:
+        import torch
+
+        result["torch_version_actual"] = torch.__version__
+        result["cuda_version_actual"] = torch.version.cuda
+        result["cuda_available"] = torch.cuda.is_available()
+        try:
+            result["gpu_name_actual"] = (
+                torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+            )
+        except Exception as e:
+            result["gpu_name_actual"] = f"<error: {e}>"
+
+        for module_name, result_key in (
+            ("cuequivariance_torch", "cuequivariance_torch"),
+            ("opt_core", "opt_core"),
+            ("boltz.model.layers.flashpairformer", "boltz_flashpairformer"),
+        ):
+            try:
+                mod = __import__(module_name, fromlist=["_"])
+                result[f"{result_key}_import_ok"] = True
+                result[f"{result_key}_version"] = getattr(mod, "__version__", "unknown")
+            except Exception as e:
+                result[f"{result_key}_import_ok"] = False
+                result[f"{result_key}_error"] = f"{type(e).__name__}: {e}"
+
+        result["exit_code"] = 0
+    except Exception as e:
+        result["exit_code"] = -1
+        result["error"] = f"{type(e).__name__}: {e}"
+        result["traceback"] = traceback.format_exc()
+
+    return result
+
+
 # Registered as a bare module-level loop (not inside a helper function) so each
 # generated function def is textually at module scope — a `for` loop doesn't
 # introduce a new scope in Python, so this satisfies Modal's "@app.function must
@@ -353,9 +406,12 @@ def run_config(cfg: dict) -> dict:
 # always the last MATRIX entry). exec() with a per-config name builds a real,
 # distinctly-named top-level `def`, exactly as if each were hand-written.
 BENCHMARK_FNS: dict[str, modal.Function] = {}
+SMOKE_FNS: dict[str, modal.Function] = {}
 for _cfg_entry in MATRIX:
     _image = build_image(_cfg_entry["torch"], _cfg_entry["cuda"])
-    _fn_name = "_bench_" + re.sub(r"[^0-9a-zA-Z_]", "_", _cfg_entry["id"])
+    _id_safe = re.sub(r"[^0-9a-zA-Z_]", "_", _cfg_entry["id"])
+    _fn_name = "_bench_" + _id_safe
+    _smoke_fn_name = "_smoke_" + _id_safe
 
     exec(
         f"""
@@ -372,11 +428,22 @@ for _cfg_entry in MATRIX:
 )
 def {_fn_name}(cfg: dict = _cfg_entry) -> dict:
     return run_config(cfg)
+
+
+@app.function(
+    image=_image,
+    gpu=_cfg_entry["gpu"],
+    timeout=15 * 60,
+    name="smoke_{_cfg_entry['id']}",
+)
+def {_smoke_fn_name}(cfg: dict = _cfg_entry) -> dict:
+    return run_smoke_test(cfg)
 """,
         globals(),
     )
 
     BENCHMARK_FNS[_cfg_entry["id"]] = globals()[_fn_name]
+    SMOKE_FNS[_cfg_entry["id"]] = globals()[_smoke_fn_name]
 
 
 def _print_matrix() -> None:
@@ -388,13 +455,17 @@ def _print_matrix() -> None:
         )
         print(row)
     print(
-        "\nRun one:  modal run modal_benchmarks/torch_cuda_benchmark.py"
+        "\nRun one:    modal run modal_benchmarks/torch_cuda_benchmark.py"
         " --config-id <id>"
-        "\nRun all:  modal run modal_benchmarks/torch_cuda_benchmark.py --run-all"
+        "\nRun all:    modal run modal_benchmarks/torch_cuda_benchmark.py --run-all"
+        "\nSmoke test: modal run modal_benchmarks/torch_cuda_benchmark.py"
+        " --config-id <id> --smoke-test"
     )
 
 
-def _run_group(cids: list[str]) -> list[dict]:
+def _run_group(
+    cids: list[str], fns: dict[str, modal.Function] = BENCHMARK_FNS
+) -> list[dict]:
     """Launch every id in `cids` concurrently and collect results as they finish.
 
     One Modal container/GPU per id. Concurrency here is bounded by len(cids), so
@@ -404,9 +475,9 @@ def _run_group(cids: list[str]) -> list[dict]:
     """
     handles = {}
     for cid in cids:
-        fn = BENCHMARK_FNS.get(cid)
+        fn = fns.get(cid)
         if fn is None:
-            known = ", ".join(BENCHMARK_FNS)
+            known = ", ".join(fns)
             print(f"Unknown config id: {cid!r}. Known ids: {known}")
             continue
         handles[cid] = fn.spawn()
@@ -447,15 +518,48 @@ def _print_summary(results: list[dict]) -> None:
         )
 
 
+def _print_smoke_summary(results: list[dict]) -> None:
+    if not results:
+        return
+    print("\n=== Smoke test summary ===")
+    checks = ("cuequivariance_torch", "opt_core", "boltz_flashpairformer")
+    header = f"{'config':28s} {'torch':12s}" + "".join(f" {c:>14s}" for c in checks)
+    print(header)
+    for r in results:
+        row = f"{r.get('config_id', '?'):28s} {r.get('torch_version_actual', '?'):12s}"
+        for c in checks:
+            ok = r.get(f"{c}_import_ok")
+            row += f" {'ok' if ok else 'FAILED':>14s}"
+        print(row)
+        for c in checks:
+            if r.get(f"{c}_import_ok") is False:
+                print(f"    {c}: {r.get(f'{c}_error')}")
+        if r.get("exit_code") != 0 and "error" in r:
+            print(f"    top-level error: {r['error']}")
+
+
 @app.local_entrypoint()
-def main(config_id: str = "", run_all: bool = False) -> None:
+def main(
+    config_id: str = "", run_all: bool = False, smoke_test: bool = False
+) -> None:
+    """Entrypoint for `modal run modal_benchmarks/torch_cuda_benchmark.py`.
+
+    --smoke-test runs run_smoke_test() instead of the full benchmark: builds
+    the same per-config image, then just checks that torch/cuEquivariance/
+    opt_core/flashpairformer all import — seconds, not minutes, so it's a cheap
+    way to validate an image-build or kernel-install change before spending a
+    full warmup+timed-runs cycle on it.
+    """
+    fns = SMOKE_FNS if smoke_test else BENCHMARK_FNS
+    print_results = _print_smoke_summary if smoke_test else _print_summary
+
     if not config_id and not run_all:
         _print_matrix()
         return
 
     if config_id and not run_all:
-        results = _run_group([config_id])
-        _print_summary(results)
+        results = _run_group([config_id], fns)
+        print_results(results)
         return
 
     # --run-all: one group per GPU type, run concurrently within each group, so
@@ -468,6 +572,6 @@ def main(config_id: str = "", run_all: bool = False) -> None:
     for gpu_label in gpu_order:
         group_ids = [cfg["id"] for cfg in MATRIX if cfg["gpu"] == gpu_label]
         print(f"\n### {gpu_label} group: {len(group_ids)} configs in parallel ###")
-        results.extend(_run_group(group_ids))
+        results.extend(_run_group(group_ids, fns))
 
-    _print_summary(results)
+    print_results(results)

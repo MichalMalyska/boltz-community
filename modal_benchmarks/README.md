@@ -120,13 +120,26 @@ modal run modal_benchmarks/torch_cuda_benchmark.py
 ```
 
 ```bash
-# run a single config (fast way to sanity-check one combo / cost)
+# cheap: build one config's image and check torch/cuEquivariance/opt_core/
+# flashpairformer all import — seconds, no boltz predict call. Use this first
+# when validating an image-build or kernel-install change.
+modal run modal_benchmarks/torch_cuda_benchmark.py --config-id torch2.6.0-cu126-A10 --smoke-test
+```
+
+```bash
+# run a single config's full benchmark (warmup + timed runs)
 modal run modal_benchmarks/torch_cuda_benchmark.py --config-id torch2.6.0-cu126-A10
 ```
 
 ```bash
 # run the entire matrix (12 configs in the default MATRIX)
 modal run modal_benchmarks/torch_cuda_benchmark.py --run-all
+```
+
+```bash
+# or smoke-test the entire matrix at once (same --run-all GPU-grouped
+# parallelism, just the cheap import check instead of the full benchmark)
+modal run modal_benchmarks/torch_cuda_benchmark.py --run-all --smoke-test
 ```
 
 Each run prints its JSON result to stdout as it finishes, and a summary table at the
