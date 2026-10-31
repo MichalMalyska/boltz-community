@@ -50,14 +50,15 @@ and adjust `MATRIX` if a pin has gone stale.
 
 **Modal setup**: `modal token new` (or `modal setup`) once, if you haven't already.
 
-**Local Python version**: each image is registered with `serialized=True` (needed
-because the per-config Functions are created dynamically in a loop, not as
-module-level definitions), which requires the image's Python to exactly match
-whatever *local* interpreter is running `modal run` itself. `PYTHON_VERSION` in
-the script is therefore derived from `sys.version_info`, not hardcoded. All pins
-in the default `MATRIX` currently publish wheels for cp310–cp313+, so this should
-just work — but if your local Python is unusually new/old and a pin 404s at
-build time, that's the first thing to check.
+**Container Python version**: fixed at 3.12 in the script (`PYTHON_VERSION`),
+independent of whatever local Python runs `modal` itself. The per-config
+Functions are registered as plain (non-serialized) Functions via a bare
+module-level loop, so there's no local/remote Python-version coupling to worry
+about — 3.12 just needs to (a) be within your Modal workspace's Image Builder
+version's supported Python range and (b) have wheels for every `MATRIX` pin,
+both true as of 2026-10-31. If your workspace's Image Builder is unusually old,
+bump it in the Modal dashboard rather than lowering `PYTHON_VERSION` below 3.10
+(the repo's own minimum).
 
 ## Running it
 

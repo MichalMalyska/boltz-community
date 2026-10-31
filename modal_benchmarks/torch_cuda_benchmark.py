@@ -23,7 +23,6 @@ Volume (one file per config id). Pull them down afterwards with:
 
 import json
 import pathlib
-import sys
 
 import modal
 
@@ -34,16 +33,12 @@ RESULTS_VOLUME_NAME = "boltz-benchmark-results"
 WEIGHTS_MOUNT = "/cache"
 RESULTS_MOUNT = "/results"
 
-# Each benchmark Function below is registered with `serialized=True` (see
-# register_benchmark), which pickles the function by value rather than looking it
-# up by import path in the container. Modal requires the image's Python to exactly
-# match the *local* interpreter running this script in that case, so this is tied
-# to sys.version_info rather than hardcoded — whatever Python invokes `modal run`
-# is what each image gets built with. All torch pins in MATRIX currently publish
-# wheels for cp310 through at least cp313, so this should resolve on any
-# reasonably current local Python; if yours is newer than that and a pin 404s,
-# either pin an older local Python for this one invocation or drop that pin.
-PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
+# Container Python version. Kept independent of whatever Python runs `modal`
+# locally (the benchmark Functions are plain, non-serialized Functions — see the
+# MATRIX registration loop below — so there's no local/remote Python-version
+# coupling to worry about). 3.12 is within every Modal Image Builder version's
+# supported range as of 2026-10-31 and has wheels for every pin in MATRIX.
+PYTHON_VERSION = "3.12"
 
 # Fixed input + predict settings, identical across every config, so the only things
 # that vary run-to-run are torch version / CUDA build / GPU type.
@@ -217,24 +212,27 @@ def run_config(cfg: dict) -> dict:
     return result
 
 
-def register_benchmark(cfg: dict) -> modal.Function:
-    image = build_image(cfg["torch"], cfg["cuda"])
+# Registered as a bare module-level loop (not inside a helper function) so each
+# `_run` def is textually at module scope — a `for` loop doesn't introduce a new
+# scope in Python, so this satisfies Modal's "@app.function must apply to
+# functions in global scope" rule without needing serialized=True. That in turn
+# means these Functions are looked up by import path inside their container, not
+# pickled by value, so there's no local/remote Python-version coupling.
+BENCHMARK_FNS: dict[str, modal.Function] = {}
+for _cfg_entry in MATRIX:
+    _image = build_image(_cfg_entry["torch"], _cfg_entry["cuda"])
 
     @app.function(
-        image=image,
-        gpu=cfg["gpu"],
+        image=_image,
+        gpu=_cfg_entry["gpu"],
         volumes={WEIGHTS_MOUNT: weights_volume, RESULTS_MOUNT: results_volume},
         timeout=30 * 60,
-        name=f"bench_{cfg['id']}",
-        serialized=True,  # created dynamically in a loop, not at module scope
+        name=f"bench_{_cfg_entry['id']}",
     )
-    def _run() -> dict:
+    def _run(cfg: dict = _cfg_entry) -> dict:
         return run_config(cfg)
 
-    return _run
-
-
-BENCHMARK_FNS = {cfg["id"]: register_benchmark(cfg) for cfg in MATRIX}
+    BENCHMARK_FNS[_cfg_entry["id"]] = _run
 
 
 def _print_matrix() -> None:
