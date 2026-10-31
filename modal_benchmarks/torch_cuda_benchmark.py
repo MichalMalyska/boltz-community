@@ -554,9 +554,13 @@ def _load_existing_result(cid: str) -> Optional[dict]:
     API hiccup) — always treated the same as "no prior result", never fatal:
     this only ever gates an optimization (skip re-running something already
     done), so failing open (re-run) is the safe default on the read side.
+
+    No .reload() here: that method is documented as "must be called inside a
+    container that mounts the Volume" and raises otherwise — this function
+    runs in the local entrypoint, not a container. read_file() alone is the
+    documented way to read a Volume's committed state from local code.
     """
     try:
-        results_volume.reload()
         data = b"".join(results_volume.read_file(f"{cid}.json"))
         return json.loads(data)
     except Exception:
@@ -584,9 +588,17 @@ def _run_group(
     force=True always re-runs regardless. Smoke tests don't persist results at
     all (nothing to check), so callers only pass check_existing=True for the
     full-benchmark path.
+
+    Every valid cid in `cids` ends up in the returned list exactly once —
+    skipped (cached), succeeded, or failed — including a remote-call failure
+    at the transport level (handle.get() itself raising, not something
+    run_config caught internally). A config silently vanishing from the
+    summary instead of showing up as a clean or failed row is exactly the
+    kind of thing that makes a real failure invisible in a 12-config sweep.
     """
-    handles = {}
-    results = []
+    results: dict[str, dict] = {}
+    handles: dict[str, object] = {}
+
     for cid in cids:
         fn = fns.get(cid)
         if fn is None:
@@ -597,15 +609,23 @@ def _run_group(
             existing = _load_existing_result(cid)
             if existing is not None and existing.get("exit_code") == 0:
                 print(f"Skipping {cid}: already have a clean result (pass --force)")
-                results.append(existing)
+                results[cid] = existing
                 continue
         handles[cid] = fn.spawn()
+
+    if handles:
+        print(f"Launching {len(handles)}: {', '.join(handles)}")
 
     for cid, handle in handles.items():
         try:
             result = handle.get()
         except Exception as e:
             print(f"FAILED to run {cid}: {e}")
+            results[cid] = {
+                "config_id": cid,
+                "exit_code": -1,
+                "error": f"remote call failed: {type(e).__name__}: {e}",
+            }
             continue
         if result.get("exit_code") == 0:
             # One line for a clean result — the full JSON (including every
@@ -616,8 +636,9 @@ def _run_group(
         else:
             print(f"\n=== {cid} (not clean — see below) ===")
             print(json.dumps(result, indent=2))
-        results.append(result)
-    return results
+        results[cid] = result
+
+    return [results[cid] for cid in cids if cid in results]
 
 
 def _one_line_summary(result: dict) -> str:

@@ -65,6 +65,14 @@ Everything here is a plain Modal app — it does nothing on its own. You run the
   tail on a failure is often just the last of many repeated warning lines
   (cuDNN's retry/fallback warnings in particular), with the actual error
   further back and truncated away before anyone sees it.
+- `_run_group` prints `Launching N: id1, id2, ...` right before spawning, and
+  guarantees every id passed to it ends up in the returned results exactly
+  once — skipped (cached), succeeded, or failed — including a config whose
+  *remote call itself* fails (`handle.get()` raising, not something
+  `run_config` caught internally): that's recorded as an `exit_code: -1` row
+  with an `error` field instead of being silently dropped. A config
+  vanishing from the summary instead of showing up as a clean or failed row
+  used to happen exactly this way and was genuinely confusing to debug.
 
 ### FlashPairformer kernels (`opt_core`)
 
