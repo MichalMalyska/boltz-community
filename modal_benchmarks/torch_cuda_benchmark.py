@@ -146,64 +146,91 @@ results_volume = modal.Volume.from_name(RESULTS_VOLUME_NAME, create_if_missing=T
 
 
 def run_config(cfg: dict) -> dict:
-    """Run inside the Modal container: time `boltz predict`, sample peak GPU memory."""
+    """Run inside the Modal container: time `boltz predict`, sample peak GPU memory.
+
+    Everything is wrapped in a broad try/except that only ever stores plain
+    str/int/float/None values into `result`. A raw exception propagating out of a
+    Modal Function gets cloudpickled back to the *local* process to be re-raised
+    there; if that exception (or its traceback frames) holds a reference to a
+    torch type — e.g. a CUDA driver/OOM error — unpickling it locally fails with
+    "the 'torch' module is not available in the local environment", since torch
+    was never installed locally. Reporting failures as plain data instead avoids
+    that regardless of what actually went wrong inside the container.
+    """
     import subprocess
     import threading
     import time
+    import traceback
 
-    import torch
-
-    mem_samples_mb = []
-    stop = threading.Event()
-
-    def poll_gpu_mem() -> None:
-        while not stop.is_set():
-            try:
-                out = subprocess.check_output(
-                    [
-                        "nvidia-smi",
-                        "--query-gpu=memory.used",
-                        "--format=csv,noheader,nounits",
-                    ],
-                    text=True,
-                )
-                mem_samples_mb.append(max(int(v) for v in out.strip().splitlines()))
-            except Exception:
-                pass
-            stop.wait(0.2)
-
-    out_dir = "/tmp/boltz_out"
-    cmd = [
-        "boltz", "predict", f"{REPO_MOUNT}/{BENCHMARK_INPUT_REL_PATH}",
-        "--out_dir", out_dir,
-        "--cache", WEIGHTS_MOUNT,
-        *PREDICT_EXTRA_ARGS,
-    ]
-
-    poller = threading.Thread(target=poll_gpu_mem, daemon=True)
-    poller.start()
-    t0 = time.perf_counter()
-    proc = subprocess.run(cmd, cwd=REPO_MOUNT, capture_output=True, text=True)
-    elapsed_s = time.perf_counter() - t0
-    stop.set()
-    poller.join(timeout=2)
-
-    result = {
+    result: dict = {
         "config_id": cfg["id"],
         "torch_version_requested": cfg["torch"],
         "cuda_tag_requested": cfg["cuda"],
         "gpu_requested": cfg["gpu"],
-        "torch_version_actual": torch.__version__,
-        "cuda_version_actual": torch.version.cuda,
-        "gpu_name_actual": (
-            torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-        ),
-        "wall_time_s": round(elapsed_s, 2),
-        "peak_gpu_mem_mb": max(mem_samples_mb) if mem_samples_mb else None,
-        "exit_code": proc.returncode,
-        "stdout_tail": proc.stdout[-4000:],
-        "stderr_tail": proc.stderr[-4000:],
     }
+
+    try:
+        import torch
+
+        result["torch_version_actual"] = torch.__version__
+        result["cuda_version_actual"] = torch.version.cuda
+        try:
+            result["gpu_name_actual"] = (
+                torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+            )
+        except Exception as e:
+            result["gpu_name_actual"] = f"<error: {e}>"
+
+        mem_samples_mb = []
+        stop = threading.Event()
+
+        def poll_gpu_mem() -> None:
+            while not stop.is_set():
+                try:
+                    out = subprocess.check_output(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=memory.used",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        text=True,
+                    )
+                    mem_samples_mb.append(
+                        max(int(v) for v in out.strip().splitlines())
+                    )
+                except Exception:
+                    pass
+                stop.wait(0.2)
+
+        out_dir = "/tmp/boltz_out"
+        cmd = [
+            "boltz", "predict", f"{REPO_MOUNT}/{BENCHMARK_INPUT_REL_PATH}",
+            "--out_dir", out_dir,
+            "--cache", WEIGHTS_MOUNT,
+            *PREDICT_EXTRA_ARGS,
+        ]
+
+        poller = threading.Thread(target=poll_gpu_mem, daemon=True)
+        poller.start()
+        t0 = time.perf_counter()
+        proc = subprocess.run(cmd, cwd=REPO_MOUNT, capture_output=True, text=True)
+        elapsed_s = time.perf_counter() - t0
+        stop.set()
+        poller.join(timeout=2)
+
+        result.update(
+            {
+                "wall_time_s": round(elapsed_s, 2),
+                "peak_gpu_mem_mb": max(mem_samples_mb) if mem_samples_mb else None,
+                "exit_code": proc.returncode,
+                "stdout_tail": proc.stdout[-4000:],
+                "stderr_tail": proc.stderr[-4000:],
+            }
+        )
+    except Exception as e:
+        result["exit_code"] = -1
+        result["error"] = f"{type(e).__name__}: {e}"
+        result["traceback"] = traceback.format_exc()
 
     with open(f"{RESULTS_MOUNT}/{cfg['id']}.json", "w") as f:
         json.dump(result, f, indent=2)
@@ -250,37 +277,74 @@ def _print_matrix() -> None:
     )
 
 
+def _run_group(cids: list[str]) -> list[dict]:
+    """Launch every id in `cids` concurrently and collect results as they finish.
+
+    One Modal container/GPU per id. Concurrency here is bounded by len(cids), so
+    callers that need to stay under an account-wide concurrent-GPU cap should
+    pass groups sized accordingly (MATRIX is split one group per GPU type below,
+    6 configs each, so --run-all never asks for more than 6 GPUs at once).
+    """
+    handles = {}
+    for cid in cids:
+        fn = BENCHMARK_FNS.get(cid)
+        if fn is None:
+            known = ", ".join(BENCHMARK_FNS)
+            print(f"Unknown config id: {cid!r}. Known ids: {known}")
+            continue
+        handles[cid] = fn.spawn()
+
+    results = []
+    for cid, handle in handles.items():
+        try:
+            result = handle.get()
+        except Exception as e:
+            print(f"FAILED to run {cid}: {e}")
+            continue
+        print(f"\n=== {cid} ===")
+        print(json.dumps(result, indent=2))
+        results.append(result)
+    return results
+
+
+def _print_summary(results: list[dict]) -> None:
+    if len(results) <= 1:
+        return
+    print("\n=== Summary ===")
+    header = (
+        f"{'config':28s} {'wall_time_s':>12s} {'peak_gpu_mem_mb':>15s} {'exit':>5s}"
+    )
+    print(header)
+    for r in results:
+        wall_time = r.get("wall_time_s")
+        wall_time_str = f"{wall_time:.1f}" if wall_time is not None else "n/a"
+        print(
+            f"{r['config_id']:28s} {wall_time_str:>12s} "
+            f"{r.get('peak_gpu_mem_mb')!s:>15s} {r.get('exit_code', -1):5d}"
+        )
+
+
 @app.local_entrypoint()
 def main(config_id: str = "", run_all: bool = False) -> None:
     if not config_id and not run_all:
         _print_matrix()
         return
 
-    target_ids = [cfg["id"] for cfg in MATRIX] if run_all else [config_id]
-    results = []
-    for cid in target_ids:
-        fn = BENCHMARK_FNS.get(cid)
-        if fn is None:
-            known = ", ".join(BENCHMARK_FNS)
-            print(f"Unknown config id: {cid!r}. Known ids: {known}")
-            continue
-        print(f"\n=== Running {cid} ===")
-        try:
-            result = fn.remote()
-        except Exception as e:
-            print(f"FAILED to run {cid}: {e}")
-            continue
-        print(json.dumps(result, indent=2))
-        results.append(result)
+    if config_id and not run_all:
+        results = _run_group([config_id])
+        _print_summary(results)
+        return
 
-    if len(results) > 1:
-        print("\n=== Summary ===")
-        header = (
-            f"{'config':28s} {'wall_time_s':>12s} {'peak_gpu_mem_mb':>15s} {'exit':>5s}"
-        )
-        print(header)
-        for r in results:
-            print(
-                f"{r['config_id']:28s} {r['wall_time_s']:12.1f} "
-                f"{r['peak_gpu_mem_mb']!s:>15s} {r['exit_code']:5d}"
-            )
+    # --run-all: one group per GPU type, run concurrently within each group, so
+    # this never requests more than max(len(group)) GPUs at once (6, for the
+    # default MATRIX — A10 batch first, then H100).
+    results = []
+    present_gpus = {cfg["gpu"] for cfg in MATRIX}
+    gpu_order = [g for g in ("A10", "H100!") if g in present_gpus]
+    gpu_order += sorted(present_gpus - set(gpu_order))  # any other GPU types, if added
+    for gpu_label in gpu_order:
+        group_ids = [cfg["id"] for cfg in MATRIX if cfg["gpu"] == gpu_label]
+        print(f"\n### {gpu_label} group: {len(group_ids)} configs in parallel ###")
+        results.extend(_run_group(group_ids))
+
+    _print_summary(results)

@@ -26,6 +26,13 @@ Everything here is a plain Modal app — it does nothing on its own. You run the
 - GPU memory is sampled via `nvidia-smi` every 200ms during the run (peak reported);
   wall time wraps the `boltz predict` subprocess only (not image build / weight
   staging).
+- A failure inside a run (driver issue, OOM, `boltz predict` crashing, etc.) is
+  caught inside the container and returned as a plain dict (`exit_code: -1`,
+  `error`, `traceback` strings) rather than raised — a raw exception referencing
+  a torch type can't be unpickled back in the local process, since torch isn't
+  installed there, so letting one escape uncaught would kill the whole run with
+  an opaque "module not available in the local environment" error instead of
+  telling you what actually went wrong.
 
 ## Before running
 
@@ -88,12 +95,14 @@ modal volume get boltz-benchmark-results / ./results
 
 ## Notes / things you may want to change
 
-- **Cost & time**: `--run-all` as shipped launches 12 runs sequentially (6 torch/CUDA
-  pairs × 2 GPU types: A10 and H100, using `H100!` to pin the exact SKU and avoid
-  Modal's silent H100→H200 auto-upgrade). First run per *image* also pays a one-time
-  build cost (installing torch + rdkit + friends). Runs are sequential by design
-  (predictable cost/ordering); if you want them in parallel, change the loop in
-  `main()` to `.spawn()` all of them first, then `.get()` each.
+- **Cost & time**: `--run-all` as shipped runs the 12 configs (6 torch/CUDA pairs ×
+  2 GPU types: A10 and H100, using `H100!` to pin the exact SKU and avoid Modal's
+  silent H100→H200 auto-upgrade) in two sequential batches — all 6 A10 configs in
+  parallel, then all 6 H100 configs in parallel — so it never asks for more than 6
+  concurrent GPUs. If your account's concurrent-GPU limit is lower than 6, either
+  trim `MATRIX` or split a batch further by calling `_run_group()` on a smaller
+  list from `main()`. First call per *image* also pays a one-time build cost
+  (installing torch + rdkit + friends).
 - **GPU string naming**: Modal's current supported GPU strings are things like `T4`,
   `L4`, `A10`, `L40S`, `A100-40GB`, `A100-80GB`, `H100`/`H100!`, `H200`, `B200`. There
   is no `A10G` — that's an AWS EC2 instance-family name, not a Modal GPU spec; `A10`
