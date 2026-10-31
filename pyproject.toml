@@ -120,6 +120,21 @@ lint.ignore = [
 "scripts/**" = [
     "INP001", # Requires __init__.py but folder is not a package.
 ]
+"modal_benchmarks/**" = [
+    "INP001",  # Requires __init__.py but folder is not a package.
+    "T201",    # CLI tool; stdout is the UI.
+    "D103",    # Missing docstring in public function
+    "D401",    # First line of docstring should be in imperative mood
+    "CPY001",  # Missing copyright notice
+    "PLC0415", # Imports gated behind a Modal container boundary, not top-level-importable
+    "S603",    # subprocess call with a fixed, non-user-controlled argv
+    "S607",    # Starting a process with a partial executable path (nvidia-smi, boltz)
+    "S108",    # Hardcoded /tmp path (ephemeral, single-use Modal container)
+    "S110",    # try/except/pass in a best-effort memory-sampling poller thread
+    "BLE001",  # Same best-effort poller
+    "PTH123",  # open() vs Path.open()
+    "PLW1510", # subprocess.run without explicit check=
+]
 
 [tool.ruff.lint.pyupgrade]
 # Preserve types, even if a file imports `from __future__ import annotations`(https://github.com/astral-sh/ruff/issues/5434)
