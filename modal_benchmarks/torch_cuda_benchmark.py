@@ -147,10 +147,27 @@ BOLTZ_DEPS = [
 # every pin, cu130 included — a cu130 config just degrades one step further if
 # cuEquivariance itself turns out not to load there, which is itself a valid,
 # informative benchmark result rather than something to special-case around.
+#
+# Exact-pinned (not just a floor), for two reasons:
+#   1. cuequivariance_ops_torch_cu12 made `torch` a hard runtime dependency
+#      (`torch>=2.11`) starting at 0.11.1 — before that (through 0.10.0) it was
+#      test-extra-only. An unbounded `>=0.5.0` floor let pip resolve the
+#      latest (0.13.0), which then silently upgraded the exactly-pinned torch
+#      build on every config whose torch version was <2.11 to a newer,
+#      wrong-CUDA-tag default-index torch — exactly the kind of cross-
+#      contamination this benchmark exists to avoid. Confirmed via PyPI's JSON
+#      API (pypi.org isn't proxy-restricted the way github.com is) that 0.10.0
+#      keeps `torch` test-extra-only and has cp312/manylinux_x86_64 wheels.
+#   2. cuEquivariance's own version should stay constant across every config
+#      anyway — it's not one of the things being compared, so letting pip
+#      silently resolve a different cuEquivariance release per torch pin would
+#      itself be an uncontrolled variable.
+CUEQUIVARIANCE_PIN = "0.10.0"
 CUDA_EXTRA_DEPS = [
-    "cuequivariance_ops_cu12>=0.5.0",
-    "cuequivariance_ops_torch_cu12>=0.5.0",
-    "cuequivariance_torch>=0.5.0",
+    f"cuequivariance=={CUEQUIVARIANCE_PIN}",
+    f"cuequivariance_ops_cu12=={CUEQUIVARIANCE_PIN}",
+    f"cuequivariance_ops_torch_cu12=={CUEQUIVARIANCE_PIN}",
+    f"cuequivariance_torch=={CUEQUIVARIANCE_PIN}",
 ]
 
 # Anthropic's FlashPairformer kernels (opt_core), per README.md's "FlashPairformer
@@ -263,6 +280,36 @@ def _run_predict_once(cmd: list[str]) -> dict:
     }
 
 
+def _torch_identity_fields(cfg: dict, torch) -> dict:  # noqa: ANN001 - torch isn't importable locally to type-check against
+    """Common torch/GPU identity fields, shared by run_config and run_smoke_test.
+
+    Includes torch_version_matches_requested: a direct check that the torch
+    actually importable in this container is the one this config asked for.
+    Without this, a transitive dependency with an unexpectedly strict version
+    floor (installed after torch, in a separate pip_install call with no
+    index-url override) can have pip's resolver silently swap the
+    exactly-pinned torch for a newer default-PyPI-index build to satisfy it —
+    exactly the kind of cross-config contamination this benchmark exists to
+    prevent, and easy to miss without an explicit check (this repo hit it once
+    already: an unbounded cuequivariance_ops_torch_cu12 floor pulled in a
+    release that made torch>=2.11 a hard dependency, upgrading every
+    sub-2.11-pin config's torch out from under it).
+    """
+    actual = torch.__version__
+    fields = {
+        "torch_version_actual": actual,
+        "cuda_version_actual": torch.version.cuda,
+        "torch_version_matches_requested": actual.startswith(cfg["torch"]),
+    }
+    try:
+        fields["gpu_name_actual"] = (
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        )
+    except Exception as e:
+        fields["gpu_name_actual"] = f"<error: {e}>"
+    return fields
+
+
 def run_config(cfg: dict) -> dict:
     """Run inside the Modal container: warmup + TIMED_RUNS timed `boltz predict`s.
 
@@ -288,14 +335,7 @@ def run_config(cfg: dict) -> dict:
     try:
         import torch
 
-        result["torch_version_actual"] = torch.__version__
-        result["cuda_version_actual"] = torch.version.cuda
-        try:
-            result["gpu_name_actual"] = (
-                torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-            )
-        except Exception as e:
-            result["gpu_name_actual"] = f"<error: {e}>"
+        result.update(_torch_identity_fields(cfg, torch))
 
         cmd = [
             "boltz", "predict", f"{REPO_MOUNT}/{BENCHMARK_INPUT_REL_PATH}",
@@ -333,9 +373,17 @@ def run_config(cfg: dict) -> dict:
                 "wall_time_s_max": max(ok_times) if ok_times else None,
                 "peak_gpu_mem_mb": max(ok_mem) if ok_mem else None,
                 # exit_code reflects the run as a whole: 0 only if every timed
-                # run succeeded, so a sweep summary can tell "fully clean" apart
-                # from "some repeats failed" at a glance.
-                "exit_code": 0 if len(ok_times) == len(timed_runs) else -1,
+                # run succeeded AND the installed torch actually matches what
+                # was requested, so a sweep summary can tell "fully clean"
+                # apart from "some repeats failed" or "wrong torch installed"
+                # at a glance — the latter would otherwise look like a normal
+                # clean result despite not measuring what it claims to.
+                "exit_code": (
+                    0
+                    if len(ok_times) == len(timed_runs)
+                    and result["torch_version_matches_requested"]
+                    else -1
+                ),
             }
         )
     except Exception as e:
@@ -369,15 +417,8 @@ def run_smoke_test(cfg: dict) -> dict:
     try:
         import torch
 
-        result["torch_version_actual"] = torch.__version__
-        result["cuda_version_actual"] = torch.version.cuda
+        result.update(_torch_identity_fields(cfg, torch))
         result["cuda_available"] = torch.cuda.is_available()
-        try:
-            result["gpu_name_actual"] = (
-                torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-            )
-        except Exception as e:
-            result["gpu_name_actual"] = f"<error: {e}>"
 
         for module_name, result_key in (
             ("cuequivariance_torch", "cuequivariance_torch"),
@@ -392,7 +433,15 @@ def run_smoke_test(cfg: dict) -> dict:
                 result[f"{result_key}_import_ok"] = False
                 result[f"{result_key}_error"] = f"{type(e).__name__}: {e}"
 
-        result["exit_code"] = 0
+        all_imports_ok = all(
+            result.get(f"{key}_import_ok")
+            for key in ("cuequivariance_torch", "opt_core", "boltz_flashpairformer")
+        )
+        result["exit_code"] = (
+            0
+            if all_imports_ok and result["torch_version_matches_requested"]
+            else -1
+        )
     except Exception as e:
         result["exit_code"] = -1
         result["error"] = f"{type(e).__name__}: {e}"
@@ -531,6 +580,12 @@ def _print_summary(results: list[dict]) -> None:
             f"{r.get('config_id', '?'):28s} {median_s:>9s} {mean_s:>9s} "
             f"{stdev_s:>8s} {r.get('peak_gpu_mem_mb')!s:>12s} {ok_total:>9s}"
         )
+        if r.get("torch_version_matches_requested") is False:
+            print(
+                f"    torch mismatch: requested {r.get('torch_version_requested')},"
+                f" got {r.get('torch_version_actual')} — this config's numbers"
+                " do not measure what they claim to; do not trust them"
+            )
 
 
 def _print_smoke_summary(results: list[dict]) -> None:
@@ -538,14 +593,25 @@ def _print_smoke_summary(results: list[dict]) -> None:
         return
     print("\n=== Smoke test summary ===")
     checks = ("cuequivariance_torch", "opt_core", "boltz_flashpairformer")
-    header = f"{'config':28s} {'torch':12s}" + "".join(f" {c:>14s}" for c in checks)
+    header = f"{'config':28s} {'torch':14s}" + "".join(f" {c:>14s}" for c in checks)
     print(header)
     for r in results:
-        row = f"{r.get('config_id', '?'):28s} {r.get('torch_version_actual', '?'):12s}"
+        torch_ok = r.get("torch_version_matches_requested")
+        torch_col = r.get("torch_version_actual", "?")
+        if torch_ok is False:
+            torch_col += " (!)"
+        row = f"{r.get('config_id', '?'):28s} {torch_col:14s}"
         for c in checks:
             ok = r.get(f"{c}_import_ok")
             row += f" {'ok' if ok else 'FAILED':>14s}"
         print(row)
+        if torch_ok is False:
+            print(
+                f"    torch mismatch: requested {r.get('torch_version_requested')},"
+                f" got {r.get('torch_version_actual')}"
+                " (a dependency likely pulled in a different torch build —"
+                " see CUDA_EXTRA_DEPS/CUEQUIVARIANCE_PIN in the script)"
+            )
         for c in checks:
             if r.get(f"{c}_import_ok") is False:
                 print(f"    {c}: {r.get(f'{c}_error')}")

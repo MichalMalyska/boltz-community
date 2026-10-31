@@ -50,6 +50,13 @@ Everything here is a plain Modal app — it does nothing on its own. You run the
   installed there, so letting one escape uncaught would kill the whole run with
   an opaque "module not available in the local environment" error instead of
   telling you what actually went wrong.
+- Every result (full run and `--smoke-test`) carries
+  `torch_version_matches_requested`: a direct check that the torch actually
+  importable in the container is the one the config asked for, not something
+  a later dependency silently swapped it for. When false, `exit_code` is
+  forced to -1 and both summary printers print an explicit `torch mismatch`
+  line — this is not hypothetical, see `CUEQUIVARIANCE_PIN` below for the bug
+  this check exists to catch.
 
 ### FlashPairformer kernels (`opt_core`)
 
@@ -210,6 +217,19 @@ uv run --with matplotlib modal_benchmarks/analyze_results.py ./results
   doesn't need `--use_msa_server` if you want network-variance-free timing.
 - **Dependency pins**: `BOLTZ_DEPS` in the script is a copy of this repo's
   `[project.dependencies]` from `pyproject.toml` with `torch` removed (torch is
-  pinned per-config instead), and `CUDA_EXTRA_DEPS` mirrors the `cuda` optional-
-  dependencies group. If either list in `pyproject.toml` changes, update the
-  matching constant here.
+  pinned per-config instead). If that list in `pyproject.toml` changes, update
+  `BOLTZ_DEPS` to match.
+- **Why cuEquivariance is exact-pinned, not floor-matched to `pyproject.toml`'s
+  unbounded `cuda` extra**: `cuequivariance_ops_torch_cu12` made `torch` a hard
+  runtime dependency (`torch>=2.11`) starting at release 0.11.1 — below that
+  (through 0.10.0) it only needed torch under its `test` extra, which this
+  install never pulls in. An unbounded floor let pip's resolver silently
+  upgrade an already-exactly-pinned older torch build to satisfy that newer
+  release's requirement — using the *default* PyPI index, not the CUDA-tag
+  index that torch was originally installed from — which is exactly the kind
+  of cross-config contamination this benchmark exists to prevent (caught via
+  `--smoke-test`: `torch_version_actual` didn't match `torch_version_requested`).
+  `CUEQUIVARIANCE_PIN` fixes all four cuequivariance packages to `0.10.0`
+  across every config, which also means cuEquivariance's own version — not one
+  of the things being compared — stays constant throughout the matrix instead
+  of drifting per torch pin.
