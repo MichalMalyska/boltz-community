@@ -53,15 +53,24 @@ Everything here is a plain Modal app — it does nothing on its own. You run the
 
 ### FlashPairformer kernels (`opt_core`)
 
-`build_image()` clones
+`build_image()` fetches
 [`anthropics/uplifting-biomolecular-modeling`](https://github.com/anthropics/uplifting-biomolecular-modeling)
 at the commit pinned in `OPT_CORE_COMMIT` (matching README.md's own
 "FlashPairformer kernels" setup section) and does an editable install of
 `common/opt_core`, plus the repo's `[project.optional-dependencies] cuda` extra
 (cuEquivariance) beforehand. `opt_core` needs compute capability 8.0+; both A10
-(sm_86) and H100 (sm_90) qualify. It's not on PyPI and the clone is public — if
-that repo is ever made private or the pinned commit goes stale, every config's
-image build fails identically and clearly, not subtly per-config.
+(sm_86) and H100 (sm_90) qualify. It's not on PyPI and the fetch is a public,
+unauthenticated GitHub archive download — if that repo is ever made private or
+the pinned commit goes stale, every config's image build fails identically and
+clearly, not subtly per-config.
+
+The fetch (`_fetch_opt_core.py`) downloads the pinned commit as a GitHub
+archive tarball via plain `urllib` + `tarfile`, deliberately *not* `git clone`
+— some Modal workspaces are still on an older/legacy Image Builder version
+pinned to an EOL Debian snapshot whose `bullseye-security` packages (`git`
+included) have rotated out of the mirror and 404 on `apt-get install`. If you
+hit that same 404 anywhere else, upgrade your workspace's Image Builder
+version at <https://modal.com/settings/image-config>.
 
 cuEquivariance's packages are named `*_cu12` upstream, but that's attempted on
 every pin including the `cu130` ones — boltz's own fallback chain (`opt_core` →

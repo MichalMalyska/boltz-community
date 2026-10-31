@@ -156,12 +156,21 @@ CUDA_EXTRA_DEPS = [
 # its prebuilt CUDA kernels are found (a plain `pip install` of the subdirectory
 # leaves some out, falling back to slower Triton kernels). Needs compute
 # capability 8.0+ — both A10 (sm_86) and H100 (sm_90) qualify.
-OPT_CORE_REPO_URL = "https://github.com/anthropics/uplifting-biomolecular-modeling.git"
+#
+# Fetched via _fetch_opt_core.py (plain urllib+tarfile, a GitHub archive
+# tarball) rather than `git clone`, deliberately avoiding any dependency on a
+# `git` binary — some Modal workspaces are still on an older/legacy Image
+# Builder version pinned to an EOL Debian snapshot whose bullseye-security
+# packages (git included) have rotated out of the mirror and 404 on
+# `apt-get install`. If that bites you elsewhere too, upgrade your workspace's
+# Image Builder version at https://modal.com/settings/image-config.
 OPT_CORE_COMMIT = "f4f62fa6592ae4938d49b1757bea0cfeff9f468e"
 OPT_CORE_CLONE_DIR = "/root/uplifting-biomolecular-modeling"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 REPO_MOUNT = "/root/boltz-community"
+FETCH_OPT_CORE_SCRIPT = pathlib.Path(__file__).resolve().parent / "_fetch_opt_core.py"
+FETCH_OPT_CORE_MOUNT = "/root/_fetch_opt_core.py"
 
 
 def _ignore_from_repo(path: pathlib.Path) -> bool:
@@ -173,7 +182,6 @@ def build_image(torch_version: str, cuda_tag: str) -> modal.Image:
     torch_index_url = f"https://download.pytorch.org/whl/{cuda_tag}"
     return (
         modal.Image.debian_slim(python_version=PYTHON_VERSION)
-        .apt_install("git")
         .pip_install(f"torch=={torch_version}", index_url=torch_index_url)
         .pip_install(*BOLTZ_DEPS)
         .pip_install(*CUDA_EXTRA_DEPS)
@@ -181,9 +189,9 @@ def build_image(torch_version: str, cuda_tag: str) -> modal.Image:
             REPO_ROOT, remote_path=REPO_MOUNT, copy=True, ignore=_ignore_from_repo
         )
         .run_commands(f"pip install --no-deps -e {REPO_MOUNT}")
+        .add_local_file(FETCH_OPT_CORE_SCRIPT, FETCH_OPT_CORE_MOUNT, copy=True)
         .run_commands(
-            f"git clone {OPT_CORE_REPO_URL} {OPT_CORE_CLONE_DIR}",
-            f"git -C {OPT_CORE_CLONE_DIR} checkout {OPT_CORE_COMMIT}",
+            f"python3 {FETCH_OPT_CORE_MOUNT} {OPT_CORE_COMMIT} {OPT_CORE_CLONE_DIR}",
             f"pip install -e {OPT_CORE_CLONE_DIR}/common/opt_core",
         )
         .env({"BOLTZ_CACHE": WEIGHTS_MOUNT, "TOKENIZERS_PARALLELISM": "false"})
